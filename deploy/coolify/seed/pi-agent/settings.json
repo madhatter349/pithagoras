@@ -1,5 +1,5 @@
 {
-  "defaultProvider": "gateway",
-  "defaultModel": "deepseek-v4.1-flash",
-  "defaultThinkingLevel": "medium"
+  "defaultProvider": "clinepass",
+  "defaultModel": "cline-pass/deepseek-v4.1-flash",
+  "defaultThinkingLevel": "high"
 }

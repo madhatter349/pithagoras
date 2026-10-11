@@ -80,13 +80,15 @@ services:
       TASK_PIDS_LIMIT: ${TASK_PIDS_LIMIT:-512}
       # Provider credentials, forwarded by name to every task container.
       #
-      # OPENAI_API_KEY is deliberately NOT set here. The seeded provider uses
-      # the self-hosted gateway, and that variable's name makes pi's built-in
-      # OpenAI provider look configured as well — so an OpenAI model picked in
-      # the UI would call api.openai.com with the gateway's key and fail with
-      # a 401 that points at the wrong thing. The gateway's key is kept where
-      # pi keeps provider keys: models.json on the data volume, which the
-      # executor mounts into every task.
+      # OPENAI_API_KEY is deliberately NOT set here. It is one of the three
+      # names the executor forwards, so it is the obvious place for a key — but
+      # pi reads that name as its built-in OpenAI provider being configured as
+      # well, so an OpenAI model picked in the UI would call api.openai.com
+      # with the wrong key and fail with a 401 naming the wrong thing. The
+      # seeded provider's key is kept where pi keeps provider keys: models.json
+      # on the data volume, which the executor mounts into every task, so no
+      # environment variable is needed at all. Set these only if you really use
+      # OpenRouter or Anthropic.
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       # Left empty on purpose: pi's own settings.json decides the model, so

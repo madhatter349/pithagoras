@@ -1,24 +1,29 @@
 {
   "providers": {
-    "gateway": {
-      "baseUrl": "https://inference.382972.xyz/v1",
+    "clinepass": {
+      "name": "ClinePass",
+      "baseUrl": "https://api.cline.bot/api/v1",
       "api": "openai-completions",
-      "apiKey": "$OPENAI_API_KEY",
+      "apiKey": "$CLINEPASS_API_KEY",
       "models": [
         {
-          "id": "auto",
-          "name": "Gateway (auto-routed)",
-          "contextWindow": 1048576,
-          "maxTokens": 384000,
+          "id": "cline-pass/deepseek-v4.1-flash",
+          "name": "DeepSeek V4.1 Flash-Wafer",
           "reasoning": true,
-          "input": ["text", "image"]
-        },
-        {
-          "id": "deepseek-v4.1-flash",
-          "name": "DeepSeek V4.1 Flash",
+          "input": ["text", "image"],
           "contextWindow": 1000000,
-          "maxTokens": 384000,
-          "reasoning": true
+          "maxTokens": 16384,
+          "thinkingLevelMap": {
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
+          },
+          "compat": {
+            "vercelGatewayRouting": { "only": ["wafer"] }
+          }
         }
       ]
     }

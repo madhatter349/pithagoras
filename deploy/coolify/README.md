@@ -14,6 +14,7 @@ from this branch, with `docker-compose.coolify.yml` as the compose file.
 | Data | `/data/pithagoras/data` on the host → `/data` |
 | Workspaces | `/data/pithagoras/workspaces` on the host → `/workspaces` |
 | Executor | `container` — one throwaway container per task |
+| Provider | `clinepass` (api.cline.bot), model shown as **DeepSeek V4.1 Flash-Wafer** |
 | Local credentials | `/data/keys/pithagoras.env` (host-side, mode 600) |
 
 ## Why the compose file is not upstream's
@@ -75,10 +76,9 @@ Two consequences worth knowing:
 
 `deploy/coolify/seed/pi-agent/` is the **template** written into
 `/data/pithagoras/data/home/.pi/agent/` before the first start. It defines one
-OpenAI-compatible provider, `gateway`, pointing at the self-hosted gateway on
-this VPS, plus a `settings.json` that makes it the default.
+provider, `clinepass`, carrying one model: `deepseek-v4.1-flash-wafer`.
 
-The template in git uses `"apiKey": "$OPENAI_API_KEY"` and holds no secret. The
+The template in git holds a `$CLINEPASS_API_KEY` placeholder and no secret. The
 deployed copy holds the key itself, because the executor mounts this directory
 into every task and pi reads the key straight from the file:
 
@@ -86,17 +86,42 @@ into every task and pi reads the key straight from the file:
 # on the host, once, before the first start
 D=/data/pithagoras/data/home/.pi/agent
 mkdir -p "$D"
-printf '%s' "$(cat /data/keys/cheapestinference-gateway.key)" \
-  | python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["providers"]["gateway"]["apiKey"]=sys.stdin.read().strip(); json.dump(d,open(p,"w"),indent=2)' "$D/models.json"
+cp seed/pi-agent/settings.json "$D/settings.json"
+cp seed/pi-agent/models.json "$D/models.json"
+# then replace the placeholder with the real key, without printing it
+python3 - "$D/models.json" <<'PY'
+import json,sys
+p=sys.argv[1]; d=json.load(open(p))
+d["providers"]["clinepass"]["apiKey"]=open("/path/to/clinepass.key").read().strip()
+json.dump(d,open(p,"w"),indent=2)
+PY
+chmod 600 "$D/models.json" "$D/settings.json"
 ```
 
 **`OPENAI_API_KEY` is deliberately not set in the Coolify environment.** It is one
-of the three names the executor forwards, so it is the obvious place for the
-gateway's key — but pi reads that name as its built-in OpenAI provider being
-configured, so the portal then offers an OpenAI entry whose models call
-`api.openai.com` with the gateway's key and fail with a 401 naming the wrong key.
-That happened on the first smoke test. With the directory mounted, no environment
-variable is needed at all.
+of the three names the executor forwards, so it is the obvious place for a key —
+but pi reads that name as its built-in OpenAI provider being configured, so the
+portal then offers an OpenAI entry whose models call `api.openai.com` with the
+wrong key and fail with a 401 that names the wrong thing. With the directory
+mounted, no environment variable is needed at all.
+
+### Why the model id is not literally `…-wafer`
+
+In pi 1.1.0 (what pi-web runs) `deepseek-v4.1-flash-wafer` is a local **alias**:
+the entry keeps the id users pick, rewrites the request to the real upstream
+`cline-pass/deepseek-v4.1-flash` through `samplingParams.model`, and pins the
+backend with `compat.vercelGatewayRouting.only = ["wafer"]`.
+
+Pithagoras pins pi **0.82.1**, which implements `vercelGatewayRouting` (verified
+in `pi-ai/dist/api/openai-completions.js`: it sends
+`providerOptions: { gateway: { only: ["wafer"] } }`) but **not** `samplingParams`.
+So the alias id is sent upstream unchanged, that model does not exist there, and
+every task dies with `404 "model not found"`.
+
+Using the real upstream id *and* the same routing pin reproduces exactly the
+backend the alias selects, and works on the pinned pi — no version bump, which
+would put the runner's `pi` out of step with the portal's RPC protocol. The model
+still shows in the UI as **DeepSeek V4.1 Flash-Wafer**.
 
 ## Deploying a change
 

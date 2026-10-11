@@ -32,6 +32,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # pinned so a rebuild does not silently change the toolchain.
 COPY --from=ghcr.io/astral-sh/uv:0.12.1 /uv /uvx /usr/local/bin/
 
+# A web-search MCP server, in the image so every task container has it on PATH.
+# pi takes its MCP servers from the container it runs in — the portal never spawns
+# them, it only reads the config — so with EXECUTOR=container the server has to be
+# installed here, not on the portal's side.
+#
+# `selectolax<1` is not optional: free-search-mcp 0.13.1 imports
+# `selectolax.parser`, which selectolax 1.0 removed, so an unpinned install raises
+# ImportError the moment the server starts. Verified 2026-10-11 against the 0.13.1
+# wheel; drop the pin once upstream stops importing that module.
+ENV UV_TOOL_BIN_DIR=/usr/local/bin
+RUN uv tool install free-search-mcp --with "selectolax<1" \
+    && rm -rf /root/.cache/uv
+
 # The same pi the portal's lock file pins, so a task and the portal are one
 # version. Bump this when the portal's lock file moves.
 ARG PI_VERSION=0.82.1

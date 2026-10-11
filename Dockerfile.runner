@@ -1,0 +1,48 @@
+# Runner image for EXECUTOR=container.
+#
+# The portal starts one throwaway container per task from this image:
+#
+#   docker run --rm -i --user <portal uid>:<gid> --cap-drop ALL \
+#     --security-opt no-new-privileges --memory … --cpus … --pids-limit … \
+#     -v <project>:/workspace -v <session>:/sessions -v <pi agent dir>:/pi-agent \
+#     pithagoras-runner:latest pi --mode rpc --session-dir /sessions
+#
+# So this image needs exactly three things: the `pi` CLI, the tools a task reaches
+# for, and a writable HOME. Everything stateful arrives as a mount — the task must
+# not carry anything of its own between runs, or the next task would inherit it.
+#
+# pi's configuration directory is mounted by the portal (see the patch in
+# server/src/executors/index.ts), so every provider set up in Settings → Models —
+# an OpenAI-compatible endpoint included — is the one the task runs on.
+
+FROM node:22-slim
+
+# git and openssh-client for real repositories; ca-certificates for HTTPS;
+# curl and wget because install scripts assume them; ripgrep, fd and jq because
+# agents reach for them constantly.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git openssh-client ca-certificates curl wget \
+      ripgrep fd-find jq unzip procps \
+      python3 python3-venv \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s "$(command -v fdfind)" /usr/local/bin/fd
+
+# uv, so a task can run Python tooling without installing anything into the image
+# (uvx fetches its own interpreter). Same static build the portal image uses,
+# pinned so a rebuild does not silently change the toolchain.
+COPY --from=ghcr.io/astral-sh/uv:0.12.1 /uv /uvx /usr/local/bin/
+
+# The same pi the portal's lock file pins, so a task and the portal are one
+# version. Bump this when the portal's lock file moves.
+ARG PI_VERSION=0.82.1
+RUN npm install -g "@earendil-works/pi-coding-agent@${PI_VERSION}" \
+    && npm cache clean --force
+
+ENV PI_CODING_AGENT_DIR=/pi-agent \
+    HOME=/root \
+    NODE_ENV=production
+
+# The mount points the portal fills in, created here so the image also works when
+# one is missing, and so Docker never creates a mount source behind our back.
+RUN mkdir -p /pi-agent /workspace /sessions
+WORKDIR /workspace

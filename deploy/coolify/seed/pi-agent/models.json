@@ -1,0 +1,26 @@
+{
+  "providers": {
+    "gateway": {
+      "baseUrl": "https://inference.382972.xyz/v1",
+      "api": "openai-completions",
+      "apiKey": "$OPENAI_API_KEY",
+      "models": [
+        {
+          "id": "auto",
+          "name": "Gateway (auto-routed)",
+          "contextWindow": 1048576,
+          "maxTokens": 384000,
+          "reasoning": true,
+          "input": ["text", "image"]
+        },
+        {
+          "id": "deepseek-v4.1-flash",
+          "name": "DeepSeek V4.1 Flash",
+          "contextWindow": 1000000,
+          "maxTokens": 384000,
+          "reasoning": true
+        }
+      ]
+    }
+  }
+}

@@ -5,6 +5,7 @@ import { hostMountPath, type DockerMount } from "./host-mounts.js";
 import { execFile, spawn } from "node:child_process";
 import path from "node:path";
 import { removeStoppedRunner } from "./stale-container.js";
+import { piAgentDir } from "../pi-settings.js";
 import { PiRpcClient } from "../pi/rpc-client.js";
 import { SdkPiClient } from "../pi/sdk-client.js";
 import type { PiClient } from "../pi/types.js";
@@ -123,11 +124,20 @@ export class ContainerExecutor implements Executor {
 
     let workspaceMount = opts.workspacePath;
     let sessionMount = sessionDir;
+    // pi's own configuration directory (settings.json, models.json, auth.json).
+    // Without it a task has no provider of its own: the only model configuration
+    // that reaches the runner is the three key variables below and --provider /
+    // --model, so anything set up under Settings → Models — an OpenAI-compatible
+    // endpoint included — would be missing inside the container. Mounted, the
+    // runner reads the same files the portal does, and a provider added in the
+    // portal works in a task without rebuilding the image.
+    let agentMount: string | undefined;
     if (process.env.PORTAL_CONTAINER_NAME) {
       const { stdout } = await promisify(execFile)("docker", ["inspect", "--format", "{{json .Mounts}}", process.env.PORTAL_CONTAINER_NAME]);
       const mounts = JSON.parse(stdout) as DockerMount[];
       workspaceMount = hostMountPath(opts.workspacePath, mounts);
       sessionMount = hostMountPath(sessionDir, mounts);
+      agentMount = hostMountPath(piAgentDir(), mounts);
     }
 
 
@@ -164,6 +174,7 @@ export class ContainerExecutor implements Executor {
       `${workspaceMount}:/workspace`,
       "-v",
       `${sessionMount}:/sessions`,
+      ...(agentMount ? ["-v", `${agentMount}:/pi-agent`, "-e", "PI_CODING_AGENT_DIR=/pi-agent"] : []),
       // Same hardening posture as the sandboxes: no extra capabilities, no
       // privilege escalation, and hard resource ceilings.
       "--cap-drop",

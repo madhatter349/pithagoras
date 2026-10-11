@@ -81,8 +81,8 @@ services:
       # Provider credentials, forwarded by name to every task container.
       #
       # OPENAI_API_KEY is deliberately NOT set here. It is one of the three
-      # names the executor forwards, so it is the obvious place for a key — but
-      # pi reads that name as its built-in OpenAI provider being configured as
+      # names the executor forwards, so it is the obvious place for a key —
+      # but pi reads that name as its built-in OpenAI provider being configured
       # well, so an OpenAI model picked in the UI would call api.openai.com
       # with the wrong key and fail with a 401 naming the wrong thing. The
       # seeded provider's key is kept where pi keeps provider keys: models.json

@@ -78,6 +78,12 @@ services:
       TASK_MEMORY_MB: ${TASK_MEMORY_MB:-1536}
       TASK_CPUS: ${TASK_CPUS:-1.5}
       TASK_PIDS_LIMIT: ${TASK_PIDS_LIMIT:-512}
+      # Read-only credentials for the skills, mounted by the executor into every
+      # task container at /credentials. A HOST path, handed to `docker run` as
+      # it stands — deliberately not mounted into this container: the portal
+      # does not need it, and only the task should reach it. Empty means no
+      # credentials reach any task, which is the safe default.
+      PI_CREDENTIALS_DIR: ${PI_CREDENTIALS_DIR:-/data/pithagoras/credentials}
       # Provider credentials, forwarded by name to every task container.
       #
       # OPENAI_API_KEY is deliberately NOT set here. It is one of the three

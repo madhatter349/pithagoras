@@ -132,6 +132,12 @@ export class ContainerExecutor implements Executor {
     // runner reads the same files the portal does, and a provider added in the
     // portal works in a task without rebuilding the image.
     let agentMount: string | undefined;
+    // Credentials the skills need, read-only, at a fixed path inside the task.
+    // This is a host path, used as given rather than translated through the
+    // portal's mounts: it belongs to this deployment, not to the portal's own
+    // filesystem, and the daemon that resolves it runs on the same host. Unset,
+    // no credentials are mounted at all — a task with none is the safe default.
+    const credentialsDir = process.env.PI_CREDENTIALS_DIR?.trim();
     // Named where a platform keeps the name stable, else the container's own
     // hostname, which Docker sets to its ID. The Compose stack on Coolify renames
     // its containers on every deploy (`portal-<uuid>-<timestamp>`), so a fixed name
@@ -188,6 +194,11 @@ export class ContainerExecutor implements Executor {
       "-v",
       `${sessionMount}:/sessions`,
       ...(agentMount ? ["-v", `${agentMount}:/pi-agent`, "-e", "PI_CODING_AGENT_DIR=/pi-agent"] : []),
+      // Read-only: a task may use these, never rewrite them. Source inside a task
+      // with `. /credentials/credentials.env`.
+      ...(credentialsDir
+        ? ["-v", `${credentialsDir}:/credentials:ro`, "-e", "PI_CREDENTIALS_DIR=/credentials"]
+        : []),
       // Same hardening posture as the sandboxes: no extra capabilities, no
       // privilege escalation, and hard resource ceilings.
       "--cap-drop",

@@ -68,7 +68,10 @@ export function repairSteps(env: NodeJS.ProcessEnv = process.env, dataDir = DATA
     ];
   }
   // A container's name is of this shape; anything else is not put in a command to be pasted.
-  const name = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(env.PORTAL_CONTAINER_NAME ?? "") ? env.PORTAL_CONTAINER_NAME! : "pithagoras";
+  // The container's own hostname is the fallback, as in the executor: a platform that
+  // renames containers on every deploy (Coolify) leaves a fixed name pointing at nothing.
+  const given = (env.PORTAL_CONTAINER_NAME || env.HOSTNAME) ?? "";
+  const name = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(given) ? given : "pithagoras";
   const volumeOf = `DATA=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{if .Name}}{{.Name}}{{else}}{{.Source}}{{end}}{{end}}{{end}}' ${name})`;
   return [
     `Stop the portal (docker stop ${name}).`,

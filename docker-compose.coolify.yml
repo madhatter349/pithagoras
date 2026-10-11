@@ -48,9 +48,13 @@ services:
       # task, and by the managed Browser/Voice add-ons.
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      # Must match container_name: the container executor translates its own
-      # mounts to host paths through it, and managed add-ons share its namespace.
-      PORTAL_CONTAINER_NAME: pithagoras
+      # PORTAL_CONTAINER_NAME is deliberately NOT set. It names the portal's own
+      # container so the container executor can translate its mounts to host paths,
+      # but Coolify renames its containers on every deploy
+      # (`portal-<uuid>-<timestamp>`), so any fixed name here goes stale and every
+      # task fails at `docker inspect`. Left unset, the portal falls back to its own
+      # hostname, which Docker sets to the container's ID and which stays correct
+      # across redeploys.
       PORT: "4100"
       # The single login password. The portal refuses to start without one, so an
       # empty value cannot quietly open the port.

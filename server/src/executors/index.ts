@@ -132,8 +132,14 @@ export class ContainerExecutor implements Executor {
     // runner reads the same files the portal does, and a provider added in the
     // portal works in a task without rebuilding the image.
     let agentMount: string | undefined;
-    if (process.env.PORTAL_CONTAINER_NAME) {
-      const { stdout } = await promisify(execFile)("docker", ["inspect", "--format", "{{json .Mounts}}", process.env.PORTAL_CONTAINER_NAME]);
+    // Named where a platform keeps the name stable, else the container's own
+    // hostname, which Docker sets to its ID. The Compose stack on Coolify renames
+    // its containers on every deploy (`portal-<uuid>-<timestamp>`), so a fixed name
+    // goes stale and every task would fail on the inspect below. Same fallback
+    // voice-service.ts uses.
+    const portalContainer = process.env.PORTAL_CONTAINER_NAME || process.env.HOSTNAME;
+    if (portalContainer) {
+      const { stdout } = await promisify(execFile)("docker", ["inspect", "--format", "{{json .Mounts}}", portalContainer]);
       const mounts = JSON.parse(stdout) as DockerMount[];
       workspaceMount = hostMountPath(opts.workspacePath, mounts);
       sessionMount = hostMountPath(sessionDir, mounts);

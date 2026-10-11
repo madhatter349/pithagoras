@@ -51,6 +51,25 @@ ARG PI_VERSION=0.82.1
 RUN npm install -g "@earendil-works/pi-coding-agent@${PI_VERSION}" \
     && npm cache clean --force
 
+# REA (reverse engineering CLI + MCP server), pinned like pi above so a rebuild
+# does not silently change the toolchain. Installed in the image, not left to a
+# task, so every throwaway container has the `rea` command on PATH.
+ARG REA_VERSION=6.4.0
+RUN npm install -g "rea-agents@${REA_VERSION}" \
+    && npm cache clean --force
+
+# REA's workflow skill, at the user-wide location pi discovers (~/.agents/skills).
+RUN mkdir -p /root/.agents/skills \
+    && cp -R "$(npm root -g)/rea-agents/skills/reverse-engineer-anything" /root/.agents/skills/ \
+    && chmod -R a+rX /root/.agents/skills
+
+# Register REA's MCP server in pi's user-wide shared MCP config, so every task
+# session gets its tools even when the mounted /pi-agent/mcp.json does not name
+# it. A same-name entry in /pi-agent/mcp.json (higher precedence) still wins, so
+# a deployment can layer provider paths on top from the host.
+RUN mkdir -p /root/.config/mcp \
+    && printf '{\n  "mcpServers": {\n    "rea": { "type": "stdio", "command": "/usr/local/bin/rea", "args": ["mcp"] }\n  }\n}\n' > /root/.config/mcp/mcp.json
+
 # The portal's bundled subagent tool, at the same absolute path it has in the
 # portal image. Pithagoras' Subagents add-on installs the portal's own copy with
 # `pi install /app/extensions/subagent` — a path that exists in the portal's image

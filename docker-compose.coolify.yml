@@ -1,32 +1,34 @@
 # Pithagoras on Coolify.
 #
-# Started from the upstream docker-compose.yml, changed in three places, each for a
-# reason that would otherwise bite on this host:
+# Started from the upstream docker-compose.yml, changed in three places, each
+# for a reason that would otherwise bite on this host:
 #
-#  1. Bridge networking with `expose`, not `network_mode: host`. Coolify's Traefik
-#     terminates HTTPS on a Docker network and cannot route to a host-networked
-#     container, so the portal is published into the proxy's network instead. The
-#     portal is then reached at https://pithagoras.382972.xyz, which is what makes
-#     it installable as an app (PWA) and lets the embedded browser work.
+#  1. Bridge networking with `expose`, not `network_mode: host`. Coolify's
+#     Traefik terminates HTTPS on a Docker network and cannot route to a
+#     host-networked container, so the portal is published into the proxy's
+#     network instead. It is then reached at https://pithagoras.382972.xyz,
+#     which is what makes it installable as an app (PWA) and lets the
+#     embedded browser work.
 #
 #  2. Data and workspaces are dedicated host directories rather than a named
-#     volume, so both survive a redeploy and can be inspected, backed up and moved
-#     from the host without going through Docker:
-#       /data/pithagoras/data        the database, sessions, agents, installed pi packages
+#     volume, so both survive a redeploy and can be inspected, backed up and
+#     moved from the host without going through Docker:
+#       /data/pithagoras/data        the database, sessions, agents, pi packages
 #       /data/pithagoras/workspaces  the folders tasks work in
-#     They are kept apart from each other on purpose: the second is where a task
-#     can write, and the portal's database must not sit inside it.
+#     They are kept apart on purpose: the second is where a task may write,
+#     and the portal's database must not sit inside it.
 #
-#  3. A `runner` service exists only to build the container executor's image and
-#     keep a container referencing it. `EXECUTOR=container` launches its own
-#     containers from that image, so nothing would reference it, and the host's
-#     weekly `docker system prune -af` deletes every image no container uses — which
-#     would break every task until the next deploy. It runs `sleep infinity`.
+#  3. A `runner` service exists only to build the container executor's image
+#     and keep a container referencing it. `EXECUTOR=container` launches its
+#     own containers from that image, so nothing else would reference it, and
+#     the host's weekly `docker system prune -af` deletes every image no
+#     container uses — which would break every task until the next deploy.
+#     It runs `sleep infinity` and never runs a task.
 #
 # Coolify adds `env_file: ['.env']` to every service, rewrites this file and
-# interpolates the app's environment variables, so the `${…}` values below are set
-# in the Coolify UI. The `:-` fallbacks are what a hand-run `docker compose up`
-# would use.
+# interpolates the app's environment variables, so the `${…}` values below are
+# set in the Coolify UI. The `:-` fallbacks are what a hand-run
+# `docker compose up` would use.
 
 services:
   portal:
@@ -34,52 +36,62 @@ services:
       context: .
       dockerfile: Dockerfile
     image: pithagoras-portal:latest
+    # Coolify overrides this with its own per-deploy name
+    # (`portal-<uuid>-<timestamp>`); it matters only for a hand-run
+    # `docker compose up`. Nothing depends on the name — see the note on
+    # PORTAL_CONTAINER_NAME below.
     container_name: pithagoras
     restart: unless-stopped
-    # Docker's own init as PID 1: it collects the processes the agent's jobs and
-    # the terminal's shells leave behind, which the portal never waits for.
+    # Docker's own init as PID 1: it collects the processes the agent's jobs
+    # and the terminal's shells leave behind, which the portal never waits
+    # for.
     init: true
     expose:
       - "4100"
     volumes:
       - ${PITHAGORAS_DATA_DIR:-/data/pithagoras/data}:/data
       - ${PITHAGORAS_WORKSPACES_DIR:-/data/pithagoras/workspaces}:/workspaces
-      # Required by EXECUTOR=container, which launches a sibling container per
-      # task, and by the managed Browser/Voice add-ons.
+      # Required by EXECUTOR=container, which launches a sibling container
+      # per task, and by the managed Browser/Voice add-ons.
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      # PORTAL_CONTAINER_NAME is deliberately NOT set. It names the portal's own
-      # container so the container executor can translate its mounts to host paths,
-      # but Coolify renames its containers on every deploy
-      # (`portal-<uuid>-<timestamp>`), so any fixed name here goes stale and every
-      # task fails at `docker inspect`. Left unset, the portal falls back to its own
-      # hostname, which Docker sets to the container's ID and which stays correct
-      # across redeploys.
+      # PORTAL_CONTAINER_NAME is deliberately NOT set. It names the portal's
+      # own container so the container executor can translate its mounts to
+      # host paths, but Coolify renames its containers on every deploy
+      # (`portal-<uuid>-<timestamp>`), so any fixed name here goes stale and
+      # every task fails at `docker inspect`. Left unset, the portal falls
+      # back to its own hostname, which Docker sets to the container's ID and
+      # which stays correct across redeploys.
       PORT: "4100"
-      # The single login password. The portal refuses to start without one, so an
-      # empty value cannot quietly open the port.
+      # The single login password. The portal refuses to start without one,
+      # so an empty value cannot quietly open the port.
       PORTAL_PASSWORD: ${PORTAL_PASSWORD}
       # Signs the login cookie. Set, or every redeploy logs everyone out.
       PORTAL_SECRET: ${PORTAL_SECRET:-}
       TZ: ${TZ:-UTC}
-      # Isolated agent execution: one throwaway container per task, with the task's
-      # project mounted and everything else left out. Never `host` on this box —
-      # that would run pi in the portal process, with the Docker socket in reach.
+      # Isolated agent execution: one throwaway container per task, with the
+      # task's project mounted and everything else left out. Never `host` on
+      # this box — that would run pi in the portal process, with the Docker
+      # socket in reach.
       EXECUTOR: container
       PI_IMAGE: pithagoras-runner:latest
       TASK_MEMORY_MB: ${TASK_MEMORY_MB:-1536}
       TASK_CPUS: ${TASK_CPUS:-1.5}
       TASK_PIDS_LIMIT: ${TASK_PIDS_LIMIT:-512}
-      # Credentials for the OpenAI-compatible endpoint seeded in
-      # ${PITHAGORAS_DATA_DIR}/home/.pi/agent/models.json, which reads it as
-      # $OPENAI_API_KEY. Passed on to every task container by name, so the key
-      # itself never appears in a command line or in `docker inspect`.
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # Provider credentials, forwarded by name to every task container.
+      #
+      # OPENAI_API_KEY is deliberately NOT set here. The seeded provider uses
+      # the self-hosted gateway, and that variable's name makes pi's built-in
+      # OpenAI provider look configured as well — so an OpenAI model picked in
+      # the UI would call api.openai.com with the gateway's key and fail with
+      # a 401 that points at the wrong thing. The gateway's key is kept where
+      # pi keeps provider keys: models.json on the data volume, which the
+      # executor mounts into every task.
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      # Left empty on purpose: pi's own settings.json decides the model, so it can
-      # be changed under Settings without touching this file or redeploying. Set
-      # they would override every choice made in the UI.
+      # Left empty on purpose: pi's own settings.json decides the model, so
+      # it can be changed under Settings without touching this file or
+      # redeploying. Set, they would override every choice made in the UI.
       PI_PROVIDER: ${PI_PROVIDER:-}
       PI_MODEL: ${PI_MODEL:-}
       PI_THINKING_LEVEL: ${PI_THINKING_LEVEL:-}

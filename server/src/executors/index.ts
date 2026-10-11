@@ -140,7 +140,14 @@ export class ContainerExecutor implements Executor {
     const portalContainer = process.env.PORTAL_CONTAINER_NAME || process.env.HOSTNAME;
     if (portalContainer) {
       const { stdout } = await promisify(execFile)("docker", ["inspect", "--format", "{{json .Mounts}}", portalContainer]);
-      const mounts = JSON.parse(stdout) as DockerMount[];
+      // A clear failure rather than a bare JSON syntax error: this is the one place
+      // the executor reads the daemon's answer, and every task depends on it.
+      let mounts: DockerMount[];
+      try {
+        mounts = JSON.parse(stdout) as DockerMount[];
+      } catch {
+        throw new Error(`docker inspect ${portalContainer} did not answer with mount data: ${stdout.slice(0, 200)}`);
+      }
       workspaceMount = hostMountPath(opts.workspacePath, mounts);
       sessionMount = hostMountPath(sessionDir, mounts);
       agentMount = hostMountPath(piAgentDir(), mounts);

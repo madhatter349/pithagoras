@@ -63,12 +63,87 @@ RUN mkdir -p /root/.agents/skills \
     && cp -R "$(npm root -g)/rea-agents/skills/reverse-engineer-anything" /root/.agents/skills/ \
     && chmod -R a+rX /root/.agents/skills
 
+# --- REA analysis engines ---------------------------------------------------
+#
+# The CLI alone can only read static JavaScript/Electron and web artifacts. The
+# engines below add the two families that need an external toolchain:
+#
+#   Ghidra + a full JDK  -> native binaries (.exe, ELF, Mach-O)      [GHIDRA_INSTALL_DIR, JAVA_HOME]
+#   JADX + apktool       -> Android APKs and managed/dex code        [REA_JADX_MCP_JAR]
+#
+# Each download is pinned by version *and* SHA-256, in the same spirit as the
+# pi/uv/free-search pins above: a rebuild must not silently swap the engine that
+# produced a report. Kept in one layer and the archives are deleted after
+# extraction, so the runner carries the tools and not the downloads.
+#
+# Versions verified 2026-10-11: rea doctor --provider ghidra reports healthy and
+# a real decompile of /usr/bin/true succeeds; apktool 3.0.3 is detected by
+# rea inspect-apktool-client on this exact node:22-slim base. Ghidra's headless
+# analysis needs no X/font packages, so none are installed.
+ARG GHIDRA_VERSION=12.1.4
+ARG GHIDRA_BUILD=20260921
+ARG GHIDRA_SHA256=ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db
+ARG TEMURIN_JDK_TAG=jdk-21.0.12.1%2B1
+ARG TEMURIN_JDK_VERSION=21.0.12.1+1
+ARG TEMURIN_JDK_FILE=OpenJDK21U-jdk_x64_linux_hotspot_21.0.12.1_1.tar.gz
+ARG TEMURIN_JDK_SHA256=ce79869e1307ed8ee1e2baa86a412b1eb5b75d10a01006d788a6f968bcfaee94
+ARG REA_JADX_VERSION=0.7.1
+ARG REA_JADX_SHA256=6e5eacf500b64292bfb73c49797c1958f6ee44646e43e868039ae7feb573ff75
+ARG APKTOOL_VERSION=3.0.3
+ARG APKTOOL_SHA256=dbf930b076c6b9be08d57c449cacefc3bdd6b71ebd59b3066fc0e1f5b14f9423
+
+ENV GHIDRA_INSTALL_DIR=/opt/tools/ghidra_${GHIDRA_VERSION}_PUBLIC \
+    JAVA_HOME=/opt/tools/jdk-${TEMURIN_JDK_VERSION} \
+    REA_JADX_MCP_JAR=/opt/tools/android/jadx-headless-mcp-${REA_JADX_VERSION}-all.jar
+
+RUN set -eux; \
+    mkdir -p /opt/tools/android /tmp/rea-engines; \
+    cd /tmp/rea-engines; \
+    curl -fL --retry 3 -o jdk.tar.gz \
+      "https://github.com/adoptium/temurin21-binaries/releases/download/${TEMURIN_JDK_TAG}/${TEMURIN_JDK_FILE}"; \
+    echo "${TEMURIN_JDK_SHA256}  jdk.tar.gz" | sha256sum -c -; \
+    curl -fL --retry 3 -o ghidra.zip \
+      "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/ghidra_${GHIDRA_VERSION}_PUBLIC_${GHIDRA_BUILD}.zip"; \
+    echo "${GHIDRA_SHA256}  ghidra.zip" | sha256sum -c -; \
+    curl -fL --retry 3 -o "${REA_JADX_MCP_JAR}" \
+      "https://github.com/1013503897/jadx-headless-mcp/releases/download/v${REA_JADX_VERSION}/jadx-headless-mcp-${REA_JADX_VERSION}-all.jar"; \
+    echo "${REA_JADX_SHA256}  ${REA_JADX_MCP_JAR}" | sha256sum -c -; \
+    curl -fL --retry 3 -o /opt/tools/android/apktool.jar \
+      "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar"; \
+    echo "${APKTOOL_SHA256}  /opt/tools/android/apktool.jar" | sha256sum -c -; \
+    tar -xzf jdk.tar.gz -C /opt/tools; \
+    unzip -q ghidra.zip -d /opt/tools; \
+    chmod +x "${GHIDRA_INSTALL_DIR}/support/analyzeHeadless" \
+      "${GHIDRA_INSTALL_DIR}/Ghidra/Features/Decompiler/os/linux_x86_64/decompile"; \
+    printf '#!/bin/sh\nJAVA="${JAVA_HOME:+$JAVA_HOME/bin/java}"\n[ -x "$JAVA" ] || JAVA="%s/bin/java"\nexec "$JAVA" -jar /opt/tools/android/apktool.jar "$@"\n' "${JAVA_HOME}" > /usr/local/bin/apktool; \
+    chmod 755 /usr/local/bin/apktool; \
+    rm -rf /tmp/rea-engines
+
+# Java on PATH as well as via JAVA_HOME, so a task can run `java -jar`/`keytool`
+# without knowing the engine layout. Nothing in the base image provides `java`,
+# so this cannot shadow a system JDK.
+ENV PATH=${JAVA_HOME}/bin:${PATH}
+
+# Fail the build, not the first task, if an engine did not land correctly. `rea
+# doctor` exits 0 even when a provider is unhealthy, so the JSON is checked
+# explicitly. apktool is invoked because its launcher (not the JAR) is what rea
+# resolves from PATH.
+RUN set -eux; \
+    rea doctor --provider ghidra --json > /tmp/rea-doctor.json; \
+    node -e 'const o=require("/tmp/rea-doctor.json"); if (!o.healthy) { console.error("rea ghidra provider is not healthy"); process.exit(1); } console.log("rea ghidra provider healthy");'; \
+    apktool --version; \
+    rm -f /tmp/rea-doctor.json
+
 # Register REA's MCP server in pi's user-wide shared MCP config, so every task
 # session gets its tools even when the mounted /pi-agent/mcp.json does not name
 # it. A same-name entry in /pi-agent/mcp.json (higher precedence) still wins, so
-# a deployment can layer provider paths on top from the host.
+# a deployment can layer provider paths on top from the host. The engine paths
+# are written into the entry too: pi spawns the MCP server as a child of the task
+# process, so it inherits these, but naming them here keeps a hand-run
+# `rea mcp` identical to what pi starts.
 RUN mkdir -p /root/.config/mcp \
-    && printf '{\n  "mcpServers": {\n    "rea": { "type": "stdio", "command": "/usr/local/bin/rea", "args": ["mcp"] }\n  }\n}\n' > /root/.config/mcp/mcp.json
+    && printf '{\n  "mcpServers": {\n    "rea": {\n      "type": "stdio",\n      "command": "/usr/local/bin/rea",\n      "args": ["mcp"],\n      "env": {\n        "GHIDRA_INSTALL_DIR": "%s",\n        "JAVA_HOME": "%s",\n        "REA_JADX_MCP_JAR": "%s"\n      }\n    }\n  }\n}\n' \
+      "${GHIDRA_INSTALL_DIR}" "${JAVA_HOME}" "${REA_JADX_MCP_JAR}" > /root/.config/mcp/mcp.json
 
 # The portal's bundled subagent tool, at the same absolute path it has in the
 # portal image. Pithagoras' Subagents add-on installs the portal's own copy with

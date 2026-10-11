@@ -179,3 +179,33 @@ Known gap: `/data/pithagoras` is a host bind mount, so the nightly restic backup
 `/var/lib/docker/volumes`) does **not** include it. `portal.db` and the chats'
 session files would not survive losing the host. Add it to that script's
 `EXTRA_PATHS` if the portal holds work worth keeping.
+
+## Credentials and MCP servers
+
+Both live in `$PITHAGORAS_DATA_DIR`, not in this repository — they hold tokens,
+so they are configured on the host and never committed.
+
+**MCP servers** are listed in `home/.pi/agent/mcp.json`. The portal never spawns
+an MCP server itself; whichever container pi runs in does. So a server has to be
+reachable from a **task container**, which is on the default bridge network and
+has no host filesystem:
+
+| Server | How it works there |
+| --- | --- |
+| `free-search` | stdio. Installed into the runner image, so the command is on `PATH`; no address is involved. |
+| `flights` | Remote HTTPS with a bearer token in `mcp.json`. Reachable from anywhere; verified with a real `flights_search_airports` call. |
+
+The adapter exposes both through its `mcp` tool rather than as individual tools.
+Individual tools are available by setting `settings.directTools` in `mcp.json`
+(`true`, or a list of server names), at the cost of roughly 150–300 prompt
+tokens per tool.
+
+**Credentials** are at `credentials/credentials.env`, a deliberate *subset* of
+the pi-web vault: Coolify, GitHub, Cloudflare and markdown-router only. The
+executor mounts the directory read-only at `/credentials` in every task when
+`PI_CREDENTIALS_DIR` is set; unset, no credentials reach a task at all. The
+portal never has them on its own filesystem.
+
+Adding a variable here means **any chat** can read it, so add only what a skill
+needs. The `coolify`, `github` and `cloudflare` skills in `skills/` are written
+against this path and are the reason it exists.

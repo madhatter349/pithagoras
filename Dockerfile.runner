@@ -51,6 +51,22 @@ ARG PI_VERSION=0.82.1
 RUN npm install -g "@earendil-works/pi-coding-agent@${PI_VERSION}" \
     && npm cache clean --force
 
+# The portal's bundled subagent tool, at the same absolute path it has in the
+# portal image. Pithagoras' Subagents add-on installs the portal's own copy with
+# `pi install /app/extensions/subagent` — a path that exists in the portal's image
+# but not in this one, so with EXECUTOR=container the tool could never load. Same
+# path here and the one package entry resolves in both. The tool spawns its own
+# `pi --mode rpc` children, so it needs no way back to the portal.
+#
+# Its only non-builtin import is typebox, which it picks up from /app/node_modules
+# in the portal image; installed here at the version the portal resolves so both
+# run the same one.
+COPY extensions/subagent /app/extensions/subagent
+RUN mkdir -p /app && cd /app \
+    && npm init -y >/dev/null 2>&1 \
+    && npm install --no-audit --no-fund --save-exact typebox@1.1.38 \
+    && npm cache clean --force
+
 ENV PI_CODING_AGENT_DIR=/pi-agent \
     HOME=/root \
     NODE_ENV=production

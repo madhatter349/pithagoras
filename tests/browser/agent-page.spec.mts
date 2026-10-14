@@ -7,11 +7,22 @@ const agent = (id: string, name: string, extra: Record<string, unknown> = {}) =>
 });
 
 /** A portal with the first agent and one more, "ada", whose folder the answers of a new agent made under that name meet. */
-async function portal(page: Page, opts: { kept?: string[]; links?: string[]; deleted?: string[]; wizard?: { initialised: boolean; kept: string[] } } = {}) {
+async function portal(page: Page, opts: { kept?: string[]; links?: string[]; deleted?: string[]; newChats?: unknown[]; wizard?: { initialised: boolean; kept: string[] } } = {}) {
   let made = false;
   let ran = false;
-  await mockPortal(page, async ({ path: p, method, url }) => {
-    if (p === '/api/agents' && method === 'GET') return { agents: [agent('home', 'Nova'), ...(made ? [agent('ada', 'Ada', { chats: 3 })] : [agent('ada', 'Ada')])] };
+  // Which agent the New button starts with, as the server keeps it.
+  let picked = 'home';
+  await mockPortal(page, async ({ path: p, method, url, json }) => {
+    if (p === '/api/agents/ada/new-chats' && method === 'PUT') {
+      const { on } = json();
+      opts.newChats?.push(on);
+      picked = on ? 'ada' : 'home';
+      return agent('ada', 'Ada', { newChats: picked === 'ada' });
+    }
+    if (p === '/api/agents' && method === 'GET') {
+      const mine = (a: ReturnType<typeof agent>) => ({ ...a, newChats: a.id === picked });
+      return { agents: [mine(agent('home', 'Nova')), ...(made ? [mine(agent('ada', 'Ada', { chats: 3 }))] : [mine(agent('ada', 'Ada'))])] };
+    }
     if (p === '/api/agents' && method === 'POST') {
       made = true;
       return { ...agent('ada', 'Ada'), kept: opts.kept ?? [] };
@@ -48,6 +59,44 @@ test('the delete dialog of an agent says that what runs in its folder is stopped
   await dialog(page).getByLabel(/Keep its folder/).check();
   await dialog(page).getByRole('button', { name: 'Delete agent' }).click();
   await expect.poll(() => deleted).toEqual(['?folder=keep']);
+});
+
+test('an agent can be made the one the New button starts with, and gives it back', async ({ page }) => {
+  const asked: unknown[] = [];
+  await portal(page, { newChats: asked });
+  await page.goto('/agents?agent=ada');
+  const ada = page.getByRole('switch', { name: 'New chats start here' });
+  await expect(ada).toHaveAttribute('aria-checked', 'false');
+  await ada.click();
+  await expect(ada).toHaveAttribute('aria-checked', 'true');
+  await ada.click();
+  await expect(ada).toHaveAttribute('aria-checked', 'false');
+  expect(asked).toEqual([true, false]);
+  // The first agent has them by default, and cannot be switched off: another agent is switched on instead.
+  await page.goto('/agents?agent=home');
+  const first = page.getByRole('switch', { name: 'New chats start here' });
+  await expect(first).toHaveAttribute('aria-checked', 'true');
+  await expect(first).toBeDisabled();
+});
+
+test('the sidebar moves its house to the agent picked, without waiting for its next poll', async ({ page }) => {
+  const asked: unknown[] = [];
+  await portal(page, { newChats: asked });
+  // Asked after the portal's, so heard first. The sidebar's list follows the pick as the server keeps it.
+  await page.route('**/api/projects*', (route) => {
+    const picked = asked.length && asked[asked.length - 1] ? 'ada' : 'home';
+    route.fulfill({ json: {
+      root: '/w', home: '/a/home', projects: [],
+      agents: [{ id: 'home', name: 'Nova', home: '/a/home', newChats: picked === 'home' }, { id: 'ada', name: 'Ada', home: '/a/ada', newChats: picked === 'ada' }],
+    } });
+  });
+  await page.goto('/agents?agent=ada');
+  const side = page.getByRole('complementary', { name: 'Sidebar' });
+  await expect(side.locator('[data-folder="home"] [data-icon="house"]')).toHaveCount(1);
+  await expect(side.locator('[data-folder="agent:ada"] [data-icon="house"]')).toHaveCount(0);
+  await page.getByRole('switch', { name: 'New chats start here' }).click();
+  await expect(side.locator('[data-folder="agent:ada"] [data-icon="house"]')).toHaveCount(1);
+  await expect(side.locator('[data-folder="home"] [data-icon="house"]')).toHaveCount(0);
 });
 
 /** The wizard's two steps, answered: a character and a name. */
@@ -205,4 +254,20 @@ test('New conversation starts the same chat as the + in the sidebar, and a chat 
   expect(posts).toEqual([{ workspace: '/a/ada' }]);
   // In the sidebar under the agent's folder at once, not with the next poll.
   await expect(page.getByRole('complementary', { name: 'Sidebar' }).getByRole('group', { name: 'Ada' }).getByText('Fresh conversation')).toBeVisible({ timeout: 2000 });
+});
+
+test('the tab strip scrolls sideways only: it has no vertical scrollbar of a pixel or two', async ({ page }) => {
+  await portal(page);
+  await page.goto('/agents?agent=ada');
+  const strip = page.getByRole('tablist', { name: 'Agent sections' });
+  await expect(strip).toBeVisible();
+  // Each tab's border sits a pixel over the strip's own, which a strip left to scroll both ways could be scrolled by.
+  expect(await strip.evaluate((el) => getComputedStyle(el).overflowY)).toBe('hidden');
+  // No scrollbar takes room beside the tabs, and wheeling over them does not move them.
+  expect(await strip.evaluate((el) => el.offsetWidth - el.clientWidth)).toBe(0);
+  const box = (await strip.boundingBox())!;
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.wheel(0, 40);
+  await page.waitForTimeout(100);
+  expect(await strip.evaluate((el) => el.scrollTop)).toBe(0);
 });

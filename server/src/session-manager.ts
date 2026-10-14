@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { LiveEvents } from "./live-events.js";
 import type { Timings } from "./llama-progress.js";
 import { forgetChat, noteToolCall, subagentGone } from "./memory-llm.js";
+import { toolCallEnded, toolCallsCutOff, toolCallStarted } from "./tool-debug.js";
 import { ModelErrors, plainFailure } from "./model-errors.js";
 import { EventEmitter } from "node:events";
 import { hasPrimary, type PersonRow, type Role } from "./people.js";
@@ -17,8 +18,11 @@ import { projectOf } from "./workspaces.js";
 import { findServerBuiltin, picturesRefused, runBuiltin } from "./pi/builtins.js";
 import { dropMessage, SessionEditError, userTexts, type Scope } from "./pi/session-edit.js";
 import { AUDIO_MESSAGE_PREFIX } from "./pi/voice-first.js";
-import { isDialog } from "./pi/ui-requests.js";
+import { isDialog, showsDialogs } from "./pi/ui-requests.js";
+import { ASK_QUESTION_TOOL, asksQuestions, describeAnswers, readAnswers, type Answers, type Question } from "./pi/ask-question.js";
+import { CHAT_QUESTION, CHAT_QUESTION_END, holdAnswers, openChatQuestion, openChatQuestions, takeHeldAnswers, type ChatQuestion, type QuestionOutcome } from "./questions.js";
 import { forgetTaint } from "./pi/guard.js";
+import { neutralise } from "./channels/framing.js";
 import { textOf } from "./pi/entries.js";
 import { removeSessionFiles } from "./session-files.js";
 import { dropImages, forLog, forPi, loadImages, removeImages, storedIn, type Attached } from "./prompt-images.js";
@@ -26,10 +30,13 @@ import { forgetBrowserSession } from "./browser/tools.js";
 import { BACKGROUND_SUPPORTED, listJobs, startedWhen, type BackgroundJob } from "./background.js";
 import { forgetSession as forgetLlamaProxy } from "./llama-progress.js";
 import { forgetCanvases } from "./canvases.js";
+import { chatEvent, chatLife, extensionHolds, serversSettled, setChatBridge } from "./extension-host.js";
 import { forTranscript } from "./stored-event.js";
 import { buildExecutor, type Executor } from "./executors/index.js";
 import { EXECUTOR_KIND } from "./executor-kind.js";
 import { describeToolCall } from "./tool-summary.js";
+import { shownPicture } from "./generated-picture.js";
+import { baseDir, readPicture } from "./workspace-files.js";
 import {
   appendEvent,
   deleteEvent,
@@ -55,6 +62,7 @@ import {
   unsettledMessages,
   unansweredCommands,
   chatModel,
+  keepChatModel,
   getSettings,
   markOrphanedSessionsInterrupted,
   openDetachedSubagents,
@@ -80,9 +88,13 @@ import {
   routineGuards,
   updateSession,
   type EventRow,
+  type SessionRow,
   sessionSubagentModel,
   anySessionRunning,
   onChannel,
+  lazyMarks,
+  lazyToolNames,
+  lazySetLabels,
 } from "./db.js";
 
 /**
@@ -242,6 +254,9 @@ function plain(text: unknown): string {
   return String(text ?? "").replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").trim();
 }
 
+/** Whether the conversation gets the ask_question tool: see asksQuestions. */
+const canAsk = (session: SessionRow) => asksQuestions(session, onChannel(session));
+
 /**
  * A command sent to pi and not yet answered. `inRun`: sent into a run, whose
  * next start is not the command's doing.
@@ -276,6 +291,8 @@ const EPHEMERAL_EVENTS = new Set([
   "portal_reload",
   // The versions of a chat's messages, which a stream also starts with.
   "portal_versions",
+  // What an extension says to its browser half: the two keep their own state, and a page that opens later asks.
+  "portal_extension_ui",
 ]);
 
 /** How long a chat's pi may go unused before it is let go: see startReaper. */
@@ -286,7 +303,18 @@ const JOB_CLOCK_SLACK_MS = 500;
 /** How many tool calls a chat remembers the time of: a chat that has made more has forgotten its oldest. */
 const CALL_WINDOWS_KEPT = 5000;
 
-export type PreparedPrompt = { message: string; onAccepted?: () => void };
+/** What a channel's ask hands pi, once it is its turn: the words, and pictures already checked and kept. */
+export type PreparedPrompt = { message: string; images?: Attached[]; onAccepted?: () => void };
+
+/** A picture the agent showed, read from the chat's folder for a channel to send on. */
+export interface SentPicture {
+  /** Base64. */
+  data: string;
+  mimeType: string;
+  /** Its file name in the chat's folder. */
+  name: string;
+  title?: string;
+}
 type AskMessage = string | (() => PreparedPrompt);
 
 interface LiveSession {
@@ -317,7 +345,43 @@ class SessionManager extends EventEmitter {
   /** Model failures pi has not recovered from: see model-errors.ts. */
   private modelErrors = new ModelErrors();
 
-  liveSnapshot(sessionId: string) { return this.stream.snapshot(sessionId); }
+  /**
+   * What a page that attaches is shown beyond the stored events: the message being written, the dialogs
+   * (confirm, select, input, editor) an extension is waiting on, and the agent's questions still open.
+   * Dialogs are live events and never stored, so without this a reload or a visit to another chat lost the
+   * dialog. A question is stored, and sent again here for a page that loads only the end of a long chat,
+   * which may not reach back to where it was asked: the page draws each question once.
+   */
+  liveSnapshot(sessionId: string) {
+    const dialogs = (this.live.get(sessionId)?.client.openDialogRequests?.() ?? [])
+      .filter((req) => req.method !== "questions")
+      .map((req) => this.stream.ephemeral(sessionId, "extension_ui_request", req));
+    const questions = this.openQuestions(sessionId).map((q) => this.stream.ephemeral(sessionId, CHAT_QUESTION, q));
+    return [...this.stream.snapshot(sessionId), ...dialogs, ...questions];
+  }
+
+  /**
+   * The agent's questions in a chat that are still open. One nobody waits on any more, whose wait is up, ends
+   * here: its timer went with the portal that asked it.
+   */
+  openQuestions(sessionId: string): ChatQuestion[] {
+    const now = Date.now();
+    return openChatQuestions(sessionId).filter((q) => {
+      if (q.until === undefined || q.until > now || this.waitedOn(sessionId, q.id)) return true;
+      this.endQuestion(sessionId, q.id, "expired");
+      return false;
+    });
+  }
+
+  /** Whether the run that asked a question is still waiting for its answer. */
+  private waitedOn(sessionId: string, id: string): boolean {
+    return (this.live.get(sessionId)?.client.openDialogRequests?.() ?? []).some((req) => req.id === id);
+  }
+
+  /** A question's record: how it ended, and the answers when it was answered. See questions.ts. */
+  private endQuestion(sessionId: string, id: string, outcome: QuestionOutcome, answers?: Answers): void {
+    this.record(sessionId, CHAT_QUESTION_END, { of: id, outcome, ...(answers ? { answers } : {}) });
+  }
   /** In-flight ask() per session, so messages in one chat are answered in turn. */
   private asking = new Map<string, Promise<string>>();
   /**
@@ -376,6 +440,8 @@ class SessionManager extends EventEmitter {
     for (const c of unansweredCommands()) {
       this.record(c.sessionId, "portal_command_end", { of: c.seq, error: c.error ?? "The portal restarted before it answered" });
     }
+    // Answers the last server took while it was stopping: they go to the agent now, as one given after a restart does.
+    for (const held of takeHeldAnswers()) this.passOnAnswers(held.sessionId, held.questions, held.answers);
     return [...new Set([...orphaned, ...unsent])].filter((id) => {
       const row = getSession(id);
       return Boolean(row?.channel_slug && row.channel_key);
@@ -473,8 +539,9 @@ class SessionManager extends EventEmitter {
   private record(sessionId: string, type: string, payload: unknown): EventRow | undefined {
     // A status line or a widget describes the chat; nobody is using it. An
     // extension that refreshes one every second kept the idle clock at zero, and
-    // the reaper never let go of the chat.
-    if (type !== "extension_ui_request" || isDialog((payload as { method?: unknown })?.method)) this.touch(sessionId);
+    // the reaper never let go of the chat. What an extension says to its
+    // browser half is the same: said on its own clock, with nobody there.
+    if (type !== "portal_extension_ui" && (type !== "extension_ui_request" || isDialog((payload as { method?: unknown })?.method))) this.touch(sessionId);
     if (EPHEMERAL_EVENTS.has(type)) {
       // Still deliver it to anyone attached right now, with a negative seq so
       // it can never be confused with a stored event during replay.
@@ -650,6 +717,51 @@ class SessionManager extends EventEmitter {
       seqs: dropped.map((m) => m.seq),
       prompts: Object.fromEntries(dropped.map((m) => [m.seq, m.prompt])),
     });
+  }
+
+  /**
+   * Takes back messages sent mid-run that pi has not read yet: `seq` is
+   * dropped for good, or — with `direct` — sent first, after the run is
+   * stopped. Whatever else waits keeps its order and goes in behind.
+   *
+   * pi can only empty its queue as a whole, so that is what is done, and the
+   * messages that stay are sent again, as they were: the same words, pictures
+   * and lane, under new numbers, in the order they were sent. Sent now, the
+   * others go in as follow-ups, since the run they steered is gone.
+   */
+  async takeBackWaiting(sessionId: string, seq: number, direct: boolean): Promise<void> {
+    const live = this.live.get(sessionId);
+    if (!live?.client.clearQueue) throw new SessionEditError("unsupported", "This agent's queue cannot be changed.");
+    // Into pi's queue first, where the clearing below reaches them.
+    await this.whenHanded(sessionId);
+    // Nothing awaited from here to the clearing: what pi takes in meanwhile is
+    // seen by takeIn, and is not on the list any more.
+    const pulled = (this.waiting.get(sessionId) ?? []).filter((m) => m.inPi);
+    const chosen = pulled.find((m) => m.seq === seq);
+    if (!chosen) throw new SessionEditError("busy", "The agent has taken that message in already.");
+    live.client.clearQueue();
+    const rest = pulled.filter((m) => m !== chosen);
+    const again = direct ? [chosen, ...rest] : rest;
+    for (const m of pulled) {
+      this.unwait(sessionId, m);
+      deleteEvent(m.seq);
+      this.tellRemoved(sessionId, { from: m.seq, to: m.seq + 1 });
+    }
+    // The pictures of the messages sent again stay on disk; a dropped one's go.
+    if (!direct) dropImages(IMAGE_ROOT, sessionId, storedIn(chosen.prompt));
+    if (direct && live.client.running) await this.abort(sessionId);
+    for (const m of again) {
+      const images = loadImages(IMAGE_ROOT, sessionId, storedIn(m.prompt));
+      // Sent now, the others wait for the run the chosen one starts: as
+      // steers, pi would read them in its first model request, together with
+      // it. Behind it, as follow-ups, they are answered after it.
+      const steer = !direct && m.prompt.steer === true;
+      await this.prompt(sessionId, m.message, {
+        ...(m.prompt.voice === true ? { voice: true } : {}),
+        ...(images.length ? { images } : {}),
+        ...(steer ? { steer: true } : {}),
+      });
+    }
   }
 
   /** Takes one message off the waiting list; false if it was no longer on it. */
@@ -861,8 +973,14 @@ class SessionManager extends EventEmitter {
     if (event.type === "tool_execution_start" || event.type === "tool_execution_end") {
       const call = `${sub ? `${msg.id}:` : ""}${String(event.toolCallId ?? "")}`;
       noteToolCall(sessionId, call, event.toolName, event.type === "tool_execution_start" ? "start" : "end");
+      const subagent = sub ? String(msg.id) : undefined;
+      if (event.type === "tool_execution_start") toolCallStarted(sessionId, call, event.toolName, subagent, event.args);
+      else toolCallEnded(sessionId, call, event.toolName, Boolean(event.isError), subagent);
     }
-    if (msg.type === "portal_subagent" && msg.op === "end") subagentGone(sessionId, String(msg.id));
+    if (msg.type === "portal_subagent" && msg.op === "end") {
+      subagentGone(sessionId, String(msg.id));
+      toolCallsCutOff(sessionId, `${msg.id}:`);
+    }
     const id = `${sub ? `${msg.id}:` : ""}${String(event.toolCallId ?? "")}`;
     let calls = this.calls.get(sessionId);
     if (event.type === "tool_execution_start") {
@@ -949,6 +1067,20 @@ class SessionManager extends EventEmitter {
     return this.live.get(sessionId)?.client.subagentStop?.(id) ?? false;
   }
 
+  /**
+   * What a page says to an extension's own half in a chat, starting the chat's
+   * pi if it is not running: a panel opened on a chat left alone for a while
+   * still reaches its extension. False where the executor cannot reach the
+   * extensions.
+   */
+  async tellExtension(sessionId: string, extension: string, data: unknown): Promise<boolean> {
+    // Asked before pi is started: where it runs in a container there is nobody to tell, and a container
+    // started only to find that out would be left running.
+    if (EXECUTOR_KIND !== "host") return false;
+    const client = await this.ensureClient(sessionId);
+    return client.tellExtension?.(extension, data) ?? false;
+  }
+
   /** The session's model is being loaded, or has finished loading. */
   reportModelLoad(sessionId: string, load: unknown): void {
     this.record(sessionId, "portal_model", load);
@@ -992,6 +1124,8 @@ class SessionManager extends EventEmitter {
   }
 
   private async startClient(sessionId: string): Promise<PiClient> {
+    // What the installed extensions' server halves add to a chat's pi is added as it loads: they are started first.
+    await serversSettled();
     // The pi that was let go still has its extensions winding down, on the same
     // conversation file: the next one starts after them.
     await this.releasing.get(sessionId);
@@ -1026,6 +1160,8 @@ class SessionManager extends EventEmitter {
       // has no business rescheduling anything; a routine run is excluded too,
       // since a routine that can create routines can build a chain unwatched.
       routineTools: session.kind === "agent",
+      questions: canAsk(session),
+      dialogs: showsDialogs(session, onChannel(session)),
       // A routine run gets the report tool instead: it is the one kind of
       // session with nobody on the other end to read what it found.
       routineSlug: session.kind === "routine" ? session.routine_slug : undefined,
@@ -1040,8 +1176,11 @@ class SessionManager extends EventEmitter {
       // The session's settled role picks the context files; the live one gates
       // each tool call, so a group conversation follows whoever is speaking.
       role: session.role,
-      toolsOff: this.piOff(sessionId),
+      ...this.toolsFor(sessionId),
       subagentModel: () => sessionSubagentModel(sessionId) ?? undefined,
+      // A chat that names no model is reopened on the model of its last answer,
+      // and after a spoken turn on the voice model that would be the voice's.
+      rememberChatModel: (provider, model) => keepChatModel(sessionId, provider, model),
       // A heartbeat is the agent looking around on its own: its own context,
       // but held to reading by a role of its own. See heartbeat.ts.
       ...(session.kind === "heartbeat"
@@ -1078,7 +1217,10 @@ class SessionManager extends EventEmitter {
     // before you can say "off everywhere" would be the wrong way round.
     void client
       .getTools?.()
-      .then((tools) => rememberTools(tools.map(remembered)))
+      .then((tools) => {
+        // A lazy tool that this chat was started with, because nobody had seen it before, is taken out of its list again.
+        if (rememberTools(tools.map(remembered)).length) return this.applyToolDefaults();
+      })
       .catch(() => {
         // A session that cannot list its tools still works; the catalogue
         // simply stays as it was.
@@ -1090,6 +1232,8 @@ class SessionManager extends EventEmitter {
       // A client stopped for an edit or a restart can still have a settle in
       // hand; it speaks for a conversation that is no longer this one.
       if (this.stopping.has(client)) return;
+      // The installed extensions' server halves hear all of it, as it is said.
+      chatEvent(sessionId, msg);
       rememberSessionFile();
       // A run the portal started failed after pi had accepted it. Said here,
       // before its agent_settled, so an ask() waiting on it fails instead of
@@ -1115,7 +1259,20 @@ class SessionManager extends EventEmitter {
       const modelFailure = this.modelErrors.take(sessionId, msg);
       if (modelFailure) this.record(sessionId, "portal_notice", { text: modelFailure, error: true });
       if (msg.type === "extension_ui_request") this.noteExtensionUi(sessionId, msg);
-      this.record(sessionId, msg.type, forTranscript(msg));
+      // The agent's questions are kept with the chat until they end, rather than live as the dialogs are.
+      if (msg.type === "extension_ui_request" && msg.method === "questions") {
+        this.record(sessionId, CHAT_QUESTION, {
+          id: msg.id,
+          ...(msg.title ? { title: msg.title } : {}),
+          questions: msg.questions,
+          ...(typeof msg.until === "number" ? { until: msg.until } : {}),
+        });
+      } else if (msg.type === "extension_ui_cancel" && typeof msg.id === "string" && openChatQuestion(sessionId, msg.id)) {
+        // A restart stops the run that waits, so that its tool returns, but the question stays open: the portal
+        // that starts next draws it again, and its answers go to the agent as a message (see respondUi).
+        const outcome = msg.reason === "expired" ? "expired" : "stopped";
+        if (!(this.closing && outcome === "stopped")) this.endQuestion(sessionId, msg.id, outcome);
+      } else this.record(sessionId, msg.type, forTranscript(msg));
       // Anything a command in hand shows for itself: see endCommand. Only what
       // a person sees in the chat — a line, a dialog, a run, a message — and
       // not a status or widget, which any extension updates on its own clock.
@@ -1238,6 +1395,7 @@ class SessionManager extends EventEmitter {
     // put it there, and a send from the box finds it.
     client.useDrafts?.({ get: () => this.drafts.get(sessionId), set: (text, caret) => this.setDraft(sessionId, text, caret) });
     this.live.set(sessionId, { client, executor });
+    chatLife("started", sessionId);
     this.touch(sessionId);
 
     return client;
@@ -1347,6 +1505,8 @@ class SessionManager extends EventEmitter {
       this.commandsInHand.has(sessionId) ||
       this.calls.has(sessionId) ||
       this.backgroundWork(sessionId) ||
+      // An extension's server half asked for this chat's pi to be kept while work of its own goes on.
+      extensionHolds(sessionId) ||
       client.isIdle?.() === false ||
       (client.dialogsOpen?.() ?? 0) > 0
     );
@@ -2129,6 +2289,12 @@ class SessionManager extends EventEmitter {
        * next message, so it needs to know one is open.
        */
       onUi?: (request: any) => void;
+      /**
+       * A picture the agent put in front of the person (show_image, or one it
+       * made or changed), read from the chat's folder: a channel has no page
+       * to draw it on, so it is sent on as it is shown.
+       */
+      onPicture?: (picture: SentPicture) => void | Promise<void>;
     } = {}
   ): Promise<string> {
     const previous = this.asking.get(sessionId) ?? Promise.resolve("");
@@ -2144,7 +2310,8 @@ class SessionManager extends EventEmitter {
           opts.onReply,
           opts.streamText,
           opts.onUi,
-          opts.onStopped
+          opts.onStopped,
+          opts.onPicture
         );
       });
     // Kept only while it is the newest, so a finished chain is not held forever.
@@ -2174,7 +2341,8 @@ class SessionManager extends EventEmitter {
     onReply?: (text: string) => void | Promise<void>,
     streamText = true,
     onUi?: (request: any) => void,
-    onStopped?: () => void
+    onStopped?: () => void,
+    onPicture?: (picture: SentPicture) => void | Promise<void>
   ): Promise<string> {
     // Counted before pi is started here, not in submit: a Stop that comes while
     // it starts is counted by then, and submit would take it for one that was
@@ -2182,7 +2350,7 @@ class SessionManager extends EventEmitter {
     const stopsBefore = this.stops.get(sessionId) ?? 0;
     const abortsBefore = this.aborts.get(sessionId) ?? 0;
     await this.ensureClient(sessionId);
-    const prepared = typeof message === "function" ? message() : { message };
+    const prepared: PreparedPrompt = typeof message === "function" ? message() : { message };
 
     // pi emits one assistant message per stretch of talking, broken up by tool
     // calls. Each is flushed as it closes so a channel can relay progress
@@ -2226,6 +2394,18 @@ class SessionManager extends EventEmitter {
         case "message_end":
           flush();
           break;
+
+        // A picture shown is part of the answer, whatever the channel relays
+        // of the work: the words that go with it are the agent's, after it.
+        case "tool_execution_end": {
+          const shown = onPicture && shownPicture(payload);
+          if (!shown) break;
+          const picture = this.pictureShown(sessionId, shown.path);
+          if (!picture) break;
+          flush();
+          void Promise.resolve(onPicture!({ ...picture, ...(shown.title ? { title: shown.title } : {}) })).catch(() => {});
+          break;
+        }
 
         case "tool_execution_start": {
           if (!onReply) break;
@@ -2312,7 +2492,8 @@ class SessionManager extends EventEmitter {
       finished.catch(() => {});
       // Stopped before it was sent: nothing for the channel to wait on, and what
       // it had to tell the agent is still to be told.
-      if ((await this.prompt(sessionId, prepared.message, undefined, false, stopsBefore)) === false) {
+      const images = prepared.images ?? [];
+      if ((await this.prompt(sessionId, prepared.message, images.length ? { images } : undefined, false, stopsBefore)) === false) {
         onStopped?.();
         return "";
       }
@@ -2325,6 +2506,22 @@ class SessionManager extends EventEmitter {
     } finally {
       clearTimeout(timer);
       this.off(`session:${sessionId}`, onEvent);
+    }
+  }
+
+  /**
+   * A picture in the chat's folder, as the page would fetch it: checked by its
+   * bytes, and never through a link out of the folder. Undefined for one that
+   * is gone since, or never was one: there is nothing to send then.
+   */
+  private pictureShown(sessionId: string, rel: string): Omit<SentPicture, "title"> | undefined {
+    const session = getSession(sessionId);
+    if (!session) return undefined;
+    try {
+      const { bytes, mimeType, name } = readPicture(baseDir(session.workspace), rel);
+      return { data: bytes.toString("base64"), mimeType, name };
+    } catch {
+      return undefined;
     }
   }
 
@@ -2410,9 +2607,39 @@ class SessionManager extends EventEmitter {
     else this.drafts.delete(sessionId);
   }
 
-  /** Answer an extension dialog for a live session. */
+  /**
+   * Answer an extension dialog for a live session, or one of the agent's questions. A question's answer, or
+   * that it was cancelled, is written down as its record. When nothing waits for it any more (the portal
+   * restarted, or the chat's pi was let go, while it was open) the answers go to the agent as a message.
+   */
   respondUi(sessionId: string, id: string, response: { cancelled?: boolean; value?: unknown }): boolean {
-    return this.live.get(sessionId)?.client.respondUi(id, response) ?? false;
+    const asked = openChatQuestion(sessionId, id);
+    const waiting = this.live.get(sessionId)?.client.respondUi(id, response) ?? false;
+    if (!asked) return waiting;
+    if (!waiting && asked.until !== undefined && asked.until <= Date.now()) {
+      this.endQuestion(sessionId, id, "expired");
+      return false;
+    }
+    const answers = response.cancelled ? undefined : readAnswers(asked.questions, response.value);
+    // While the portal stops, a message would start a pi that it no longer lets go, cut off as it exits. The
+    // answers are written down, and held for the portal that starts next to pass on (see recoverOrphans).
+    this.endQuestion(sessionId, id, answers ? "answered" : "cancelled", answers);
+    if (!waiting && answers && this.closing) holdAnswers(sessionId, id);
+    else if (!waiting && answers) this.passOnAnswers(sessionId, asked.questions, answers);
+    return true;
+  }
+
+  /** Answers to questions nothing waits for any more, sent to the agent as a message. */
+  private passOnAnswers(sessionId: string, questions: Question[], answers: Answers): void {
+    const message = [
+      "<answer-from-primary>",
+      "These are the answers to the questions you asked with ask_question. Your run ended before they came (the portal restarted while you waited, for one), so they come as this message: go on from there.",
+      "",
+      // What was typed in is the person's, as a channel's sender's words are: it cannot close the frame or open one.
+      neutralise(describeAnswers(questions, answers)),
+      "</answer-from-primary>",
+    ].join("\n");
+    this.prompt(sessionId, message).catch((e) => console.error(`[portal] could not pass on the answers in ${sessionId}: ${(e as Error).message}`));
   }
 
   /**
@@ -2443,6 +2670,24 @@ class SessionManager extends EventEmitter {
    */
   piOff(sessionId: string, names: string[] = [], view: McpView = mcpView(), homes?: AgentHome[]): string[] {
     return [...new Set([...this.offFor(sessionId, names, view.known().keys(), homes), ...withdrawnMcpTools(names, view)])].sort();
+  }
+
+  /**
+   * Of the tools marked lazy, the ones this conversation has on: not offered one by one, and reached
+   * through the `tools` tool. What is off (piOff) is off for good and so not among them. `sets` names
+   * what they are, for the hint to the model.
+   */
+  piLazy(off: string[]): { tools: string[]; sets: string[] } {
+    const gone = new Set(off);
+    const tools = [...lazyToolNames()].filter((name) => !gone.has(name)).sort();
+    return { tools, sets: lazySetLabels(tools) };
+  }
+
+  /** What pi is told about the tools when a conversation starts: the ones that are off, and the lazy ones that are on. */
+  private toolsFor(sessionId: string): { toolsOff: string[]; toolsLazy: string[]; lazySets: string[] } {
+    const toolsOff = this.piOff(sessionId);
+    const lazy = this.piLazy(toolsOff);
+    return { toolsOff, toolsLazy: lazy.tools, lazySets: lazy.sets };
   }
 
   /**
@@ -2478,7 +2723,7 @@ class SessionManager extends EventEmitter {
   async getTools(sessionId: string): Promise<{ tools: PiTool[]; live: boolean }> {
     const client = this.live.get(sessionId)?.client;
     const reported = client?.getTools ? await client.getTools() : [];
-    if (reported.length) rememberTools(reported.map(remembered));
+    if (reported.length && rememberTools(reported.map(remembered)).length) await this.applyToolDefaults();
     const session = getSession(sessionId);
     const workspace = session?.workspace;
     const view = mcpView();
@@ -2486,10 +2731,15 @@ class SessionManager extends EventEmitter {
     // What the chat's agent, project and routine start it with, which is what it is "default" against.
     const defaults = toolDefaultsForSession(session);
     const exceptions = sessionTools(sessionId);
+    const lazy = lazyMarks(view);
     const servers = view.servers;
-    const shown: { name: string; source: string; description?: string; inline?: true; cached?: true }[] = listed.length ? listed : shownTools(workspace, view);
+    // An idle chat is shown what the portal has seen registered; the tool is not there for every kind of chat (see asksQuestions).
+    const asks = session ? canAsk(session) : true;
+    const shown: { name: string; source: string; package?: string | null; description?: string; inline?: true; cached?: true }[] = listed.length
+      ? listed
+      : shownTools(workspace, view).filter((tool) => asks || !(tool.name === ASK_QUESTION_TOOL && tool.inline));
     return {
-      tools: shown.map(({ name, source, description, inline, cached }) => ({
+      tools: shown.map(({ name, source, package: pkg, description, inline, cached }) => ({
         name,
         ...(description !== undefined ? { description } : {}),
         source: toolSource(name, source, servers),
@@ -2498,6 +2748,8 @@ class SessionManager extends EventEmitter {
         ...(cached ? { cached: true as const } : {}),
         enabled: toolEnabled(name, defaults, exceptions),
         defaultOn: !defaults.includes(name),
+        // Not offered one by one but found through the `tools` tool, or an MCP server's through `mcp`: the page says so beside the switch.
+        ...lazy({ name, source, package: pkg }),
       })),
       live: Boolean(listed.length),
     };
@@ -2538,7 +2790,8 @@ class SessionManager extends EventEmitter {
     // in every chat, and one that is switched back on in the chat needs one.
     setSessionTools(sessionId, exceptionsFor(heldOffUnshown(wantedOff, shown, held), toolDefaultsForSession(session), answered, held));
     const off = this.offFor(sessionId, listed.map((t) => t.name), view.known().keys());
-    await client?.setToolsOff?.(this.piOff(sessionId, reported.map((t) => t.name), view));
+    const piOff = this.piOff(sessionId, reported.map((t) => t.name), view);
+    await client?.setToolsOff?.(piOff, this.piLazy(piOff));
     return off;
   }
 
@@ -2571,7 +2824,8 @@ class SessionManager extends EventEmitter {
         // page showing the opposite of what the database now holds.
         try {
           const listed = client.getTools ? await client.getTools() : [];
-          await client.setToolsOff?.(this.piOff(sessionId, listed.map((t) => t.name), view, homes));
+          const off = this.piOff(sessionId, listed.map((t) => t.name), view, homes);
+          await client.setToolsOff?.(off, this.piLazy(off));
           return true;
         } catch (e) {
           console.error(`[portal] could not apply the tool defaults to ${sessionId}: ${(e as Error).message}`);
@@ -2600,7 +2854,7 @@ class SessionManager extends EventEmitter {
       [...this.live.entries()].map(async ([sessionId, { client }]) => {
         // A subagent in the background would be stopped by the reload: its
         // chat is idle, and still working.
-        if (this.isBusy(sessionId) || this.compacting.has(sessionId) || this.editing.has(sessionId) || this.backgroundWork(sessionId)) {
+        if (this.isBusy(sessionId) || this.compacting.has(sessionId) || this.editing.has(sessionId) || this.backgroundWork(sessionId) || extensionHolds(sessionId)) {
           waiting++;
           return false;
         }
@@ -2742,6 +2996,7 @@ class SessionManager extends EventEmitter {
 
   /** pi is gone, and what it was holding with it. */
   private forgetPi(sessionId: string): void {
+    chatLife("stopped", sessionId);
     this.activity.delete(sessionId);
     this.dropCommands(sessionId);
     // No memory tool of its is running any more, whatever it last said.
@@ -2759,6 +3014,7 @@ class SessionManager extends EventEmitter {
     this.failuresSaid.delete(sessionId);
     this.inRun.delete(sessionId);
     this.calls.delete(sessionId);
+    toolCallsCutOff(sessionId);
     this.callWindows.delete(sessionId);
     this.fresh.delete(sessionId);
     this.piQueue.delete(sessionId);
@@ -2816,6 +3072,7 @@ class SessionManager extends EventEmitter {
     this.aborts.delete(sessionId);
     // Its temporary canvases are in memory only, so no row delete reaches them.
     forgetCanvases(sessionId);
+    chatLife("deleted", sessionId);
     // Each on its own: pi's folder is the one that can refuse, and the pictures
     // are what would then stay downloadable.
     for (const [what, remove] of [
@@ -2885,4 +3142,5 @@ class SessionManager extends EventEmitter {
 }
 
 export const sessions = new SessionManager();
+setChatBridge({ tell: (chatId, extension, data) => sessions.tellExtension(chatId, extension, data) });
 export { SESSION_ROOT, IMAGE_ROOT };

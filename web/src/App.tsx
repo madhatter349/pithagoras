@@ -2,12 +2,12 @@ import { LuMenu, LuX } from "react-icons/lu";
 import { appendLiveEvents, resetLiveEvents } from "./live-events";
 import { fillFrom } from "./editor-fills";
 import { Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { Navigate, Route, Routes, useNavigate, useParams } from "react-router-dom";
-import { api, ApiError, SIGNED_OUT, type PortalEvent, type Session, type SessionStatus } from "./api";
+import { Navigate, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
+import { api, ApiError, SIGNED_OUT, type PortalEvent, type Session, type SessionStatus, type SingleSignOn } from "./api";
 import { DialogFailed, ErrorBoundary } from "./components/ErrorBoundary";
 import { Sidebar } from "./components/Sidebar";
 import { Chat } from "./components/Chat";
-import { Login } from "./components/Login";
+import { Login, Setup } from "./components/Login";
 import { isTab, type Tab } from "./settings-tabs";
 import { setupDismissed } from "./setup-state";
 import { load as loadCached, prefetchSettings } from "./settings-cache";
@@ -15,6 +15,7 @@ import { ExtensionDialog, type UiRequest } from "./components/ExtensionDialog";
 import { lazyComponent } from "./lazy";
 import { ThemeSwitcher } from "./components/ThemeSwitcher";
 import { ConfirmHost } from "./components/ConfirmDialog";
+import { UpdateNotice } from "./components/UpdateNotice";
 import { ErrorBanner, ghostCls } from "./components/SettingsUi";
 import { pollWhileVisible, reconnectDelay } from "./poll";
 import { canvasConnection, canvasMessage } from "./canvas-feed";
@@ -27,6 +28,10 @@ import { reconcile } from "./reconcile";
 import { useStable } from "./use-stable";
 import { useDialogFocus } from "./dialog-focus";
 import { t, useLanguage } from "./i18n";
+import { setNavigate, startExtensions } from "./extensions/loader";
+import { extensionMessage } from "./extensions/channel";
+import { serverPush, setChatOnScreen } from "./extensions/server-feed";
+import { useSlot } from "./extensions/slots";
 
 // What the first draw needs is the shell, the chat and the sign-in page. The other pages, and the dialogs that
 // open over them, are fetched when they are first opened, so that they are not in the file everyone waits for.
@@ -37,17 +42,22 @@ const RoutinesPage = lazyComponent(() => import("./components/RoutinesPage"), "R
 const AuditPage = lazyComponent(() => import("./components/AuditPanel"), "AuditPage");
 const BrowserPage = lazyComponent(() => import("./components/BrowserPage"), "BrowserPage");
 const MemoryPage = lazyComponent(() => import("./components/MemoryPage"), "MemoryPage");
-const ImagesPage = lazyComponent(() => import("./components/ImagesPage"), "ImagesPage");
+const MediaPage = lazyComponent(() => import("./components/MediaPage"), "MediaPage");
+const ExtensionPage = lazyComponent(() => import("./components/ExtensionPage"), "ExtensionPage");
 const ConfigModal = lazyComponent(() => import("./components/ConfigModal"), "ConfigModal");
 const SetupAssistant = lazyComponent(() => import("./components/SetupAssistant"), "SetupAssistant");
 
-// Legacy routes ("session", "global") still resolve — old links stay valid.
-const LEGACY_TABS: Record<string, Tab> = { session: "general", global: "general" };
+// Legacy routes still resolve — old links stay valid: "session" and "global" were the defaults, "password" and "sso" had a tab each before they were both on Authentication, and so did the pictures and the videos before there was one tab for both.
+const LEGACY_TABS: Record<string, Tab> = { session: "general", global: "general", password: "authentication", sso: "authentication", images: "media", videos: "media" };
 
 export default function App() {
   // Everything under here is drawn again in a language chosen (see i18n.ts).
   useLanguage();
   const [authed, setAuthed] = useState<boolean | null>(null);
+  /** No password has been chosen yet: the first start, or after it was removed with the reset command. */
+  const [setup, setSetup] = useState(false);
+  /** The single sign-on provider the login page offers, where there is one. */
+  const [sso, setSso] = useState<SingleSignOn | undefined>();
   /** The portal did not answer when asked who is signed in: not the same as nobody being. */
   const [unreachable, setUnreachable] = useState(false);
   const failed = useRef(0);
@@ -58,6 +68,8 @@ export default function App() {
       (s) => {
         failed.current = 0;
         setUnreachable(false);
+        setSetup(Boolean(s.setup));
+        setSso(s.oidc);
         setAuthed(s.authed);
       },
       (e) => {
@@ -106,7 +118,7 @@ export default function App() {
         <div className="fixed right-4 top-4 z-10">
           <ThemeSwitcher />
         </div>
-        <Login onSuccess={() => setAuthed(true)} />
+        {setup ? <Setup onSuccess={() => { setSetup(false); setAuthed(true); }} /> : <Login sso={sso} onSuccess={() => setAuthed(true)} onSetup={() => setSetup(true)} />}
       </>
     );
   }
@@ -126,8 +138,13 @@ export default function App() {
       <Route path="/routines" element={<Shell view="routines" />} />
       <Route path="/browser" element={<Shell view="browser" />} />
       <Route path="/memory" element={<Shell view="memory" />} />
-      <Route path="/images" element={<Shell view="images" />} />
+      <Route path="/media" element={<Shell view="media" />} />
+      {/* Where the pictures and the videos were while each had a page: old links and bookmarks. */}
+      <Route path="/images" element={<MediaRedirect show="images" />} />
+      <Route path="/videos" element={<MediaRedirect show="videos" />} />
       <Route path="/audit" element={<Shell view="audit" />} />
+      {/* A page an extension brought: /x/<extension>/<page id>, and an extension's name may have a slash in it. */}
+      <Route path="/x/*" element={<Shell view="extension" />} />
       <Route path="/s/:sessionId" element={<Shell />} />
       <Route path="/s/:sessionId/settings" element={<Shell settings />} />
       <Route path="/s/:sessionId/settings/:tab" element={<Shell settings />} />
@@ -139,6 +156,14 @@ export default function App() {
   );
 }
 
+/** The gallery of one kind that was a page of its own, as one of the two kinds of the Media page, with the filters it had. */
+function MediaRedirect({ show }: { show: "images" | "videos" }) {
+  const { search } = useLocation();
+  const params = new URLSearchParams(search);
+  params.set("show", show);
+  return <Navigate to={{ pathname: "/media", search: `?${params}` }} replace />;
+}
+
 /** Once per page load, not once per page: the Shell is drawn again on every route. */
 let setupAsked = false;
 
@@ -147,10 +172,16 @@ function Shell({
   view = "chat",
 }: {
   settings?: boolean;
-  view?: "chat" | "sessions" | "projects" | "agents" | "routines" | "browser" | "memory" | "images" | "audit";
+  view?: "chat" | "sessions" | "projects" | "agents" | "routines" | "browser" | "memory" | "media" | "audit" | "extension";
 }) {
-  const { sessionId, tab } = useParams<{ sessionId?: string; tab?: string }>();
+  const { sessionId, tab, "*": extensionPage = "" } = useParams<{ sessionId?: string; tab?: string; "*"?: string }>();
   const navigate = useNavigate();
+  // What the installed extensions draw in the portal: see extensions/loader.ts.
+  useEffect(() => {
+    setNavigate(navigate);
+    startExtensions();
+  }, [navigate]);
+  const pages = useSlot("nav.page");
   const [mobileNav, setMobileNav] = useState(false);
   useEffect(() => { setMobileNav(false); }, [sessionId, view, settings]);
   // The drawer covers the page and keeps the keyboard; widened to a window with the sidebar in place, it is only the sidebar.
@@ -195,19 +226,19 @@ function Shell({
   const [hasBrowser, setHasBrowser] = useState(false);
   // Whether Understory is the agent's memory, which is when its page is in the sidebar.
   const [hasMemory, setHasMemory] = useState(false);
-  // Likewise whether image generation is on and has an address, which is when the Images page is.
-  const [hasImages, setHasImages] = useState(false);
+  // Likewise whether image generation or video generation is on and has an address, which is when the Media page is.
+  const [hasMedia, setHasMedia] = useState(false);
   useEffect(() => {
     const ask = () =>
       api
         .featureFlags()
         .then((f) => {
           setHasMemory(f.understory?.enabled === true);
-          setHasImages(f.images?.enabled === true);
+          setHasMedia(f.images?.enabled === true || f.videos?.enabled === true);
         })
         .catch(() => {});
     ask();
-    // Said by Settings when it switches Understory (Add-ons) or the images (Agent → Images), so the sidebar follows at once.
+    // Said by Settings when it switches Understory (Add-ons), the images or the videos (Agent → Media), so the sidebar follows at once.
     window.addEventListener("features-changed", ask);
     return () => window.removeEventListener("features-changed", ask);
   }, []);
@@ -253,7 +284,7 @@ function Shell({
     return r.sessions;
   }, []);
 
-  /** A chat started in `workspace`, or in Home without one, and opened. */
+  /** A chat started in `workspace`, or where "New" goes (the agent picked for new chats) without one, and opened. */
   const startChat = useStable(async (workspace?: string) => {
     const s = await api.createSession(workspace);
     await refreshSessions();
@@ -308,6 +339,8 @@ function Shell({
     // Nothing to read from: the stream of a chat that is gone only fails, and was retried as an outage.
     if (!sessionId || missing === sessionId) return;
 
+    // The chat whose stream is open, for an extension that comes into the page later: see extensions/loader.ts.
+    setChatOnScreen(sessionId);
     let cancelled = false;
     let seq = 0;
     let failed = 0;
@@ -372,6 +405,11 @@ function Shell({
         setEvents(resetLiveEvents);
       });
       es.addEventListener("canvas", (m) => canvasMessage(sessionId, JSON.parse((m as MessageEvent).data)));
+      // What the installed extensions' server halves tell what they drew on this chat: see extensions/server-feed.ts.
+      es.addEventListener("extension", (m) => {
+        const { extension, data } = JSON.parse((m as MessageEvent).data) as { extension: string; data: unknown };
+        serverPush(sessionId, extension, data);
+      });
       // Until it has caught up, what arrives is history being replayed. It is
       // gathered and applied in one go: drawing the conversation once per event
       // is what made a long one open at the top, build downwards over seconds and
@@ -463,6 +501,12 @@ function Shell({
           reload();
           return;
         }
+        // An extension to what its browser half drew in this chat: theirs, and nothing of the conversation.
+        if (ev.type === "portal_extension_ui") {
+          const { extension, data } = ev.payload as { extension: string; data: unknown };
+          extensionMessage(sessionId, extension, data);
+          return;
+        }
         // Live-only events (dialogs) use a negative seq and must not move the
         // resume cursor, or reconnecting would skip real history.
         if (ev.seq > 0) seq = ev.seq;
@@ -517,6 +561,7 @@ function Shell({
       clearTimeout(timer);
       esRef.current?.close();
       canvasConnection(sessionId, "down");
+      setChatOnScreen(undefined);
     };
   }, [sessionId, missing, refreshSessions]);
 
@@ -650,6 +695,7 @@ function Shell({
     refreshSessions();
   });
   const onOpenSettings = useStable(() => navigate(sessionId ? `/s/${sessionId}/settings/general` : "/settings/general"));
+  const openUpdate = useStable(() => navigate(sessionId ? `/s/${sessionId}/settings/about` : "/settings/about"));
   const closeSettings = useStable(() => navigate(active ? `/s/${active.id}` : "/"));
   const setUpModel = useStable(() => {
     navigate(active ? `/s/${active.id}` : "/");
@@ -686,10 +732,10 @@ function Shell({
         sessions={sessions}
         executor={executor}
         activeId={sessionId ?? null}
-        view={view}
+        view={view === "extension" ? `x/${extensionPage}` : view}
         hasBrowser={hasBrowser}
         hasMemory={hasMemory}
-        hasImages={hasImages}
+        hasMedia={hasMedia}
         places={places}
         onNavigate={onNavigate}
         onOpenFolder={onOpenFolder}
@@ -707,8 +753,9 @@ function Shell({
             would only repeat its title; in voice mode that header is gone. */}
         <header className="app-mobile-bar flex shrink-0 items-center gap-3 border-b border-line px-3 py-2 md:hidden">
           <button type="button" aria-label={t("Open navigation")} aria-expanded={mobileNav} aria-controls="mobile-navigation" onClick={() => setMobileNav(true)} className="rounded-lg p-2 text-fg hover:bg-fg/10"><LuMenu size={20}/></button>
-          <span className="truncate text-sm text-fg">{active?.title || "Pithagoras"}</span>
+          <span className="truncate text-sm text-fg">{(view === "extension" && pages.find((p) => p.key === extensionPage)?.title) || active?.title || "Pithagoras"}</span>
         </header>
+        <UpdateNotice onDetails={openUpdate} />
         {error && <ErrorBanner className="mx-4 mt-2" onClose={() => setError(null)}>{error}</ErrorBanner>}
         {/* Not for the first miss: a server restarting, or a wifi that blinked,
             is back before it can be read. Two in a row is an outage. */}
@@ -745,17 +792,19 @@ function Shell({
             }}
           />
         ) : view === "agents" ? (
-          <AgentPage onSelect={(id) => navigate(`/s/${id}`)} onNewChat={startChat} />
+          <AgentPage onSelect={(id) => navigate(`/s/${id}`)} onNewChat={startChat} reloadPlaces={reloadPlaces} />
         ) : view === "routines" ? (
           <RoutinesPage onOpenSession={(id) => navigate(`/s/${id}`)} />
         ) : view === "browser" ? (
           <BrowserPage onOpenSession={(id) => navigate(`/s/${id}`)} />
         ) : view === "memory" ? (
           <MemoryPage />
-        ) : view === "images" ? (
-          <ImagesPage />
+        ) : view === "media" ? (
+          <MediaPage />
         ) : view === "audit" ? (
           <AuditPage />
+        ) : view === "extension" ? (
+          <ExtensionPage entryKey={extensionPage} />
         ) : active ? (
           <Chat
             session={active}
@@ -792,6 +841,13 @@ function Shell({
             }}
             onDeleteMessage={async (seq) => {
               await api.deleteMessage(active.id, seq);
+            }}
+            onTakeBackQueued={async (seq) => {
+              await api.takeBackQueued(active.id, seq);
+            }}
+            onSendQueuedNow={async (seq) => {
+              await api.sendQueuedNow(active.id, seq);
+              refreshSessions();
             }}
             onAbort={async () => {
               await api.abort(active.id);

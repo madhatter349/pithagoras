@@ -47,7 +47,7 @@ RUN uv tool install free-search-mcp --with "selectolax<1" \
 
 # The same pi the portal's lock file pins, so a task and the portal are one
 # version. Bump this when the portal's lock file moves.
-ARG PI_VERSION=0.82.1
+ARG PI_VERSION=1.1.0
 RUN npm install -g "@earendil-works/pi-coding-agent@${PI_VERSION}" \
     && npm cache clean --force
 

@@ -1,11 +1,18 @@
 import { useEffect, useState } from "react";
 import { LuCheck, LuPencil, LuX } from "react-icons/lu";
 import { api, ApiError } from "../api";
-import { LoadFailed } from "./SettingsUi";
+import { LoadFailed, Section } from "./SettingsUi";
+import { Select } from "./Select";
 import { ToolGroupList } from "./ToolGroupList";
-import { displayName, nextOff, sourceName } from "../tool-groups";
+import { displayName, nextOff, sourceName, sourceOf } from "../tool-groups";
 import { isEnter, isEscape } from "../shortcuts";
-import { t } from "../i18n";
+import { t, tp } from "../i18n";
+
+/** What ask_question may wait for, in minutes; 0 is until it is answered. The server holds the same list. */
+const QUESTION_WAITS = [0, 5, 15, 30, 60];
+
+/** How a single tool is marked lazy next to the sets; the server keys it the same way (lazyToolEntry). */
+const lazyEntry = (name: string): string => `<tool>${name}`;
 
 /**
  * Which tools every conversation starts with.
@@ -21,7 +28,7 @@ import { t } from "../i18n";
  * wrong way round.
  */
 export function ToolDefaults({ onError }: { onError: (e: string) => void }) {
-  const [tools, setTools] = useState<{ name: string; source: string; inline?: true }[]>([]);
+  const [tools, setTools] = useState<{ name: string; source: string; inline?: true; lazy?: true; mcp?: string; noLazy?: true }[]>([]);
   const [off, setOff] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   /** Why there is nothing to switch here, where the deployment cannot do it. */
@@ -31,6 +38,9 @@ export function ToolDefaults({ onError }: { onError: (e: string) => void }) {
   const [tries, setTries] = useState(0);
   const [busy, setBusy] = useState(false);
   const [names, setNames] = useState<Record<string, string>>({});
+  /** What is marked lazy: sets as the list keys them, and single tools as `<tool>name`. */
+  const [lazy, setLazy] = useState<string[]>([]);
+  const [questionWait, setQuestionWait] = useState(0);
   /** The group being renamed, and what has been typed so far. */
   const [renaming, setRenaming] = useState<{ source: string; value: string } | null>(null);
 
@@ -42,6 +52,8 @@ export function ToolDefaults({ onError }: { onError: (e: string) => void }) {
         setTools(r.tools);
         setOff(r.off);
         setNames(r.names ?? {});
+        setLazy(r.lazy ?? []);
+        setQuestionWait(r.questionWaitMinutes ?? 0);
       })
       // A deployment where this cannot work says so in place of the list — the
       // same as the switches beside the composer, and for the same reason. Only
@@ -60,6 +72,50 @@ export function ToolDefaults({ onError }: { onError: (e: string) => void }) {
       setOff(r.off);
     } catch (e) {
       setOff(before);
+      onError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const changeQuestionWait = async (minutes: number) => {
+    const before = questionWait;
+    setQuestionWait(minutes);
+    try {
+      setQuestionWait((await api.setQuestionWait(minutes)).waitMinutes);
+    } catch (e) {
+      setQuestionWait(before);
+      onError((e as Error).message);
+    }
+  };
+
+  /**
+   * Make a set or a single tool lazy, or ordinary again. Lazy touches no switch: the tool stays on or
+   * off as it was, and only the model's list changes.
+   */
+  const flipLazy = async (entry: string) => {
+    const wanted = lazy.includes(entry) ? lazy.filter((s) => s !== entry) : [...lazy, entry];
+    setBusy(true);
+    try {
+      const r = await api.setLazyToolSets(wanted);
+      setLazy(r.lazy);
+    } catch (e) {
+      onError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /**
+   * Make an MCP server's tools lazy, or register them one by one. It is the server's own setting, "Register tools
+   * directly", turned off for lazy: the one switch, not a mark of the portal's. It is read when a chat starts.
+   */
+  const flipMcp = async (server: string, lazyNow: boolean) => {
+    setBusy(true);
+    try {
+      await api.setMcpDirect(server, lazyNow);
+      setTools((all) => all.map((tool) => (tool.mcp === server ? { ...tool, lazy: lazyNow ? undefined : (true as const) } : tool)));
+    } catch (e) {
       onError((e as Error).message);
     } finally {
       setBusy(false);
@@ -116,6 +172,19 @@ export function ToolDefaults({ onError }: { onError: (e: string) => void }) {
         </p>
       </section>
 
+      <Section
+        title={t("Questions from the agent")}
+        hint={t("How long the agent's ask_question tool waits for your answer before it carries on without one. By default it waits until you answer; Stop in the message box ends the wait at any time. The setting is read each time a question is asked.")}
+      >
+        <Select
+          aria-label={t("Wait for an answer")}
+          className="w-48"
+          value={questionWait}
+          onChange={changeQuestionWait}
+          options={QUESTION_WAITS.map((m) => ({ value: m, label: m ? tp(m, "{n} minute", "{n} minutes") : t("Until answered") }))}
+        />
+      </Section>
+
       {!tools.length ? (
         <p className="rounded-xl border border-line bg-raised/40 px-3 py-2 text-xs text-fg-subtle">
           {t("Nothing listed yet. Tools appear once a conversation has run — that is when pi builds the list of what its extensions registered.")}
@@ -127,7 +196,14 @@ export function ToolDefaults({ onError }: { onError: (e: string) => void }) {
               the second changes while this is open. */}
           <ToolGroupList
             roomy
-            tools={tools.map((tool) => ({ ...tool, enabled: !off.includes(tool.name) }))}
+            tools={tools.map((tool) => ({
+              ...tool,
+              enabled: !off.includes(tool.name),
+              // Marked as a set or on its own: found through the `tools` tool, which the list says beside it. An MCP server's tool is the server's to say.
+              lazy: tool.mcp !== undefined ? tool.lazy : !tool.noLazy && (lazy.includes(sourceOf(tool)) || lazy.includes(lazyEntry(tool.name))) ? (true as const) : undefined,
+            }))}
+            onLazy={(tool) => flipLazy(lazyEntry(tool.name))}
+            lazyFixed={(tool) => tool.mcp !== undefined || lazy.includes(sourceOf(tool))}
             names={names}
             busy={busy}
             onFlip={flip}
@@ -173,15 +249,45 @@ export function ToolDefaults({ onError }: { onError: (e: string) => void }) {
             }
             // Only here, not in the chat popover: naming a thing is a settings decision, and the popover is for one chat.
             beside={(group) => (
-              <button
-                type="button"
-                onClick={() => setRenaming({ source: group.source, value: names[group.source] ?? "" })}
-                title={t("Rename — it is {source}", { source: sourceName(group.source) })}
-                aria-label={t("Rename {name}", { name: sourceName(group.source) })}
-                className="shrink-0 rounded p-1 text-fg-subtle transition hover:bg-fg/5 hover:text-fg"
-              >
-                <LuPencil className="h-3 w-3" />
-              </button>
+              <>
+                {/* Not for pi's own tools: those are always offered. An MCP server's group has the server's setting. */}
+                {group.tools.some((tool) => !tool.noLazy) && (() => {
+                  const server = group.tools.find((tool) => tool.mcp !== undefined)?.mcp;
+                  const pressed = server !== undefined ? group.tools.every((tool) => tool.lazy) : lazy.includes(group.source);
+                  // Nothing in the set is offered while every tool is off, so there is nothing for a mark to change.
+                  const idle = group.allOff;
+                  return (
+                    <button
+                      type="button"
+                      disabled={busy || idle}
+                      aria-pressed={pressed}
+                      onClick={() => (server !== undefined ? flipMcp(server, pressed) : flipLazy(group.source))}
+                      title={
+                        idle
+                          ? t("All of its tools are off by default, so none is offered to the model, lazy or not, except where an agent, project, routine or chat switches them on. Switch one on here to change the lazy mark.")
+                          : server !== undefined
+                          ? t("Lazy: the server's tools are not in the model's list one by one; the model finds and calls them through the `mcp` tool. It is the server's \"Register tools directly\", turned off, and it applies to chats that start from now on. They stay on or off as they are.")
+                          : t("Lazy: its tools are not in the model's list one by one; the model finds and calls them through the `tools` tool, so nothing in the set is lost to it. They stay on or off as they are; an off tool is not reachable that way. Tools that turn up later start lazy too.")
+                      }
+                      aria-label={t("Lazy {name}", { name: displayName(group.source, names) })}
+                      className={`shrink-0 rounded px-1.5 py-0.5 text-[11px] transition hover:bg-fg/5 disabled:cursor-not-allowed disabled:opacity-50 ${
+                        pressed ? "bg-accent/15 text-accent" : "text-fg-subtle hover:text-fg"
+                      }`}
+                    >
+                      {t("lazy")}
+                    </button>
+                  );
+                })()}
+                <button
+                  type="button"
+                  onClick={() => setRenaming({ source: group.source, value: names[group.source] ?? "" })}
+                  title={t("Rename — it is {source}", { source: sourceName(group.source) })}
+                  aria-label={t("Rename {name}", { name: sourceName(group.source) })}
+                  className="shrink-0 rounded p-1 text-fg-subtle transition hover:bg-fg/5 hover:text-fg"
+                >
+                  <LuPencil className="h-3 w-3" />
+                </button>
+              </>
             )}
           />
         </div>

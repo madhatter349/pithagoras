@@ -23,6 +23,10 @@ export interface LaunchOptions {
   sessionFile?: string;
   /** Give this session the routine tools. Channel sessions only. */
   routineTools?: boolean;
+  /** Give this session the ask_question tool. Chats a person talks to in the portal's pages only. */
+  questions?: boolean;
+  /** Whether a dialog an extension opens is shown to a person. Off for a routine, a heartbeat and a channel's chat, where it is answered at once with its no-answer value. */
+  dialogs?: boolean;
   /** The routine being run, when this is a routine session. Enables reporting. */
   routineSlug?: string | null;
   /** Lowest role the conversation serves; decides which context files load. */
@@ -35,10 +39,16 @@ export interface LaunchOptions {
   browserNow?: () => { allowed: boolean; allowlist: string[] };
   /** Tools this conversation has switched off, by name. */
   toolsOff?: string[];
+  /** The tools that are on and lazy: found through the `tools` tool, not offered one by one. */
+  toolsLazy?: string[];
+  /** What those tools are called as sets, for the hint to the model. */
+  lazySets?: string[];
   /** What its subagents run on, when it says: asked each time one starts. */
   subagentModel?: () => string | undefined;
   /** The agent whose heartbeat this session is, when it is one: gives it the note tool. */
   heartbeatAgent?: string;
+  /** Told the chat's model when a spoken turn is about to run on another. */
+  rememberChatModel?: (provider: string, modelId: string) => void;
 }
 
 export interface Executor {
@@ -54,6 +64,13 @@ export interface Executor {
    */
   readonly resumes?: boolean;
 }
+
+/** The environment variable each cloud provider's key is in, as pi reads it. */
+const PROVIDER_KEYS: Record<string, string> = {
+  openrouter: "OPENROUTER_API_KEY",
+  anthropic: "ANTHROPIC_API_KEY",
+  openai: "OPENAI_API_KEY",
+};
 
 function piArgs(opts: LaunchOptions, sessionDir: string): string[] {
   const args = ["--mode", "rpc", "--session-dir", sessionDir];
@@ -79,6 +96,8 @@ export class HostExecutor implements Executor {
       sessionDir: path.join(this.sessionRoot, opts.sessionId),
       sessionFile: opts.sessionFile,
       routineTools: opts.routineTools,
+      questions: opts.questions,
+      dialogs: opts.dialogs,
       routineSlug: opts.routineSlug,
       role: opts.role,
       sessionId: opts.sessionId,
@@ -86,8 +105,11 @@ export class HostExecutor implements Executor {
       enforceTaint: opts.enforceTaint,
       browserNow: opts.browserNow,
       toolsOff: opts.toolsOff,
+      toolsLazy: opts.toolsLazy,
+      lazySets: opts.lazySets,
       subagentModel: opts.subagentModel,
       heartbeatAgent: opts.heartbeatAgent,
+      rememberChatModel: opts.rememberChatModel,
       provider: opts.provider,
       modelId: opts.model,
       thinkingLevel: opts.thinkingLevel,
@@ -163,14 +185,13 @@ export class ContainerExecutor implements Executor {
 
     // By name only: docker copies the value from its own environment, which is
     // this one, and a value on the command line is readable by anybody on the
-    // host who lists processes while the task runs.
-    const passthrough = [
-      "OPENROUTER_API_KEY",
-      "ANTHROPIC_API_KEY",
-      "OPENAI_API_KEY",
-      "PI_PROVIDER",
-      "PI_MODEL",
-    ].flatMap((key) => (process.env[key] ? ["-e", key] : []));
+    // host who lists processes while the task runs. Of the provider keys, only
+    // the one for the provider the chat runs on: the others are not its to have,
+    // and a key in its environment is a provider pi may reach for (#15).
+    const keys = opts.provider
+      ? (PROVIDER_KEYS[opts.provider] ? [PROVIDER_KEYS[opts.provider]] : [])
+      : Object.values(PROVIDER_KEYS);
+    const passthrough = [...keys, "PI_PROVIDER", "PI_MODEL"].flatMap((key) => (process.env[key] ? ["-e", key] : []));
 
     const args = [
       "run",
@@ -221,7 +242,7 @@ export class ContainerExecutor implements Executor {
 
     await removeStoppedRunner(opts.sessionId);
     const child = spawn("docker", args, { stdio: ["pipe", "pipe", "pipe"] });
-    return new PiRpcClient(child);
+    return new PiRpcClient(child, opts.dialogs);
   }
 
   async cleanup(sessionId: string): Promise<void> {

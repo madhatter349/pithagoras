@@ -9,7 +9,7 @@ import { pictureIn } from "./show-image-tool.js";
 
 /**
  * Making a picture from a description, with the image model the person set up
- * in Settings → Agent → Images, and putting it in front of them.
+ * in Settings → Agent → Media, and putting it in front of them.
  *
  * What it returns is what show_image returns — the picture's path in the chat's
  * folder, and a title, with a mark that it is this tool's (see generated-picture.ts)
@@ -17,7 +17,7 @@ import { pictureIn } from "./show-image-tool.js";
  * a thumbnail under the tool line in the chat, the picture window in voice
  * mode. The picture is written into a folder of its own inside the chat's, which
  * is where /sessions/:id/picture serves from, under a name made here, never
- * one the agent or the endpoint chose. It is also listed in the Images page's
+ * one the agent or the endpoint chose. It is also listed in the Media page's
  * gallery, with what it was asked for (see image-gallery.ts).
  */
 
@@ -83,15 +83,13 @@ export class GenerateImageTool {
       name: GENERATE_IMAGE_TOOL,
       label: "generate image",
       description:
-        "Make a new picture from a description with the image model the person has set up, and show it to them. " +
-        "The picture is a PNG, JPEG, GIF or WebP saved in the chat's folder and appears on their screen as show_image's does, " +
-        "so do not call show_image on it. Describe what it should show: the subject, the style, the setting, the colours. " +
-        "It can take a minute and costs the person something, so make one picture, and another only when asked. " +
-        "Give a short title. Say in words what you made; do not describe it in detail unless asked.",
+        "Make a picture from a description with the person's image model, save it in the chat's folder and show it (no show_image needed). " +
+        "Describe subject, style, setting, colours. Slow and costs the person: one picture unless asked for more. " +
+        "Give a short title; say briefly what you made.",
       parameters: Type.Object({
-        prompt: Type.String({ description: "What the picture should show." }),
-        title: Type.Optional(Type.String({ description: "A few words shown above the picture." })),
-        size: Type.Optional(Type.String({ description: 'Width and height in pixels, such as "1024x1024". Leave it out for the usual size.' })),
+        prompt: Type.String({ description: "What it should show" }),
+        title: Type.Optional(Type.String({ description: "A few words shown above it" })),
+        size: Type.Optional(Type.String({ description: "WIDTHxHEIGHT in pixels, e.g. 1024x1024; omit for the default" })),
       }),
       execute: async (_id: string, p: { prompt: string; title?: string; size?: string }, signal?: AbortSignal) => {
         // Read now, not when the tool was loaded: an address, a model or a key changed since is in force.

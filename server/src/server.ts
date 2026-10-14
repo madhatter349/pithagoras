@@ -4,6 +4,7 @@ import { interruptCanvasWrites } from "./canvases.js";
 import { eventsRouter } from "./api/events.js";
 import { serveWeb } from "./web-static.js";
 import { clampLevel } from "./pi/model-runtime.js";
+import { ASK_QUESTION_TOOL } from "./pi/ask-question.js";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
@@ -14,6 +15,7 @@ import cookieParser from "cookie-parser";
 import { nanoid } from "nanoid";
 import {
   BROWSER_CHANNEL,
+  clearProjectAgent,
   clearProjectTools,
   chatModel,
   contextLimitProblem,
@@ -23,6 +25,8 @@ import {
   getDb,
   getDefaultContextLimit,
   getSession,
+  recordAudit,
+  trustedResults,
   getSettingDefaults,
   getSettings,
   listAgentSessions,
@@ -31,7 +35,11 @@ import {
   listRoutineSessions,
   listSessions,
   projectTools,
+  projectAgent,
+  projectAgents,
   projectsWithTools,
+  releaseProjectsOf,
+  setProjectAgent,
   agentTools,
   setAgentTools,
   clearAgentTools,
@@ -43,12 +51,20 @@ import {
   setContextLimit,
   setDefaultContextLimit,
   setProjectTools,
+  setQuestionWaitMinutes,
   setSettings,
   setToolDefaultsOff,
   setToolGroupNames,
+  QUESTION_WAIT_MINUTES,
+  questionWaitMinutes,
   shownStoredSettings,
   shownTools,
   toolDefaultsOff,
+  lazyAllowed,
+  lazyMarks,
+  lazyRefused,
+  lazyToolSets,
+  setLazyToolSets,
   toolGroupNames,
   updateSession,
 } from "./db.js";
@@ -57,9 +73,11 @@ import { insideReal, isWithinText } from "./within.js";
 import { agentHome, agentHomePath } from "./agent-home.js";
 import { dataFolder } from "./data-dir.js";
 import { resolveChannelSession } from "./agent.js";
-import { AgentError, agentOf, agentsRoot, chatsOf, defaultAgent, deletable, deleteAgent, getAgent, listAgents, orbOf } from "./agents.js";
+import { AgentError, agentsRoot, chatsOf, defaultAgent, deletable, deleteAgent, getAgent, listAgents, newChatAgent, orbOf } from "./agents.js";
 import { sweepRemoved } from "./folder-removal.js";
 import { agentsRouter } from "./api/agents.js";
+import { agentFor, linkedAgent } from "./project-agent.js";
+import { understoryOn } from "./features.js";
 import { heartbeat } from "./heartbeat.js";
 import { deleteNotesOf } from "./activity.js";
 import { EXECUTOR_KIND } from "./executor-kind.js";
@@ -67,9 +85,14 @@ import { sessions, CommandFailed, IMAGE_ROOT } from "./session-manager.js";
 import { ImageError, MAX_IMAGE_BYTES, MAX_IMAGES, imagePath, mimeOf, parseImages, saveImages } from "./prompt-images.js";
 import { defaultsFor, exceptionsFor, heldOffUnshown, toolEnabled, toolSource } from "./tool-policy.js";
 import { mcpRouter, mcpServerNames, onMcpWritten } from "./api/mcp.js";
-import { authEnabled, checkPassword, isAuthed, issueCookie, keptShortPassword, requireAuth, signOut } from "./auth.js";
+import { authMode, changePassword, checkPassword, isAuthed, issueCookie, passwordRefused, requireAuth, setUpPassword, shortPassword, signOut } from "./auth.js";
+import { activeSso, endSessionUrl, oidcRouter, providerFor, rememberProvider } from "./oidc-login.js";
+import { CALLBACK_PATH, OidcConfigError, discover, parseOidcConfig, shownForm } from "./oidc.js";
+import { removeSso, saveSso, ssoConfig } from "./sso-settings.js";
+import { sweep } from "./login-streams.js";
 import { packagesRouter } from "./api/packages.js";
-import { extensionsRouter } from "./api/extensions.js";
+import { extensionsRouter, noteLoadedExtensions, syncExtensionServers } from "./api/extensions.js";
+import { extensionRoutes, openingFor, stopServerHalves } from "./extension-host.js";
 import { channelsRouter } from "./api/channels.js";
 import { removeRoutines, routinesIn, routinesRouter, switchOffRoutines } from "./api/routines.js";
 import { filesRouter } from "./api/files.js";
@@ -79,6 +102,8 @@ import { skillsRouter } from "./api/skills.js";
 import { featuresRouter } from "./api/features.js";
 import { imagesRouter } from "./api/images.js";
 import { forgetPicturesIn } from "./image-gallery.js";
+import { videosRouter } from "./api/videos.js";
+import { forgetVideosIn } from "./video-gallery.js";
 import { memoryRouter } from "./api/memory.js";
 import { memoryLlmRouter } from "./memory-llm.js";
 import { modelLevels, modelRuntime, providersRouter } from "./api/providers.js";
@@ -91,8 +116,15 @@ import { attachBrowserUpgrade, mountBrowserProxy } from "./browser-proxy.js";
 import { watchBrowserFrames } from "./extensions/browser-frames.js";
 import { startLlamaProxy } from "./llama-progress.js";
 import { applyOnStart } from "./sandbox/apply.js";
+import { trustFlagged } from "./pi/guard.js";
 import { sandboxPolicy, sandboxSupport } from "./sandbox/policy.js";
 import { sandboxRouter } from "./api/sandbox.js";
+import { logsRouter } from "./api/logs.js";
+import { restartRouter } from "./api/restart.js";
+import { startUpdateChecks, updateRouter } from "./api/update.js";
+import { requestedExit } from "./restart.js";
+import { LOG_BOOT } from "./logs.js";
+import { closeConnections } from "./close-connections.js";
 import { scheduleDreams } from "./extensions/understory-service.js";
 import { routineSupervisor } from "./routines/supervisor.js";
 import { channelSupervisor } from "./channels/supervisor.js";
@@ -138,36 +170,139 @@ const promptJson = express.json({ limit: `${Math.ceil((MAX_IMAGES * MAX_IMAGE_BY
 // An upload is the file itself, streamed to disk by its route, whatever type
 // the browser gave it — a .json file must not be read as a request.
 const UPLOAD_ROUTE = /^\/api\/sessions\/[^/]+\/upload$/;
-// An edit on the Images page may carry a mask, a picture: its route reads its own, after the login too.
+// An edit on the Media page may carry a mask, a picture: its route reads its own, after the login too.
 const IMAGE_EDIT_ROUTE = "/api/images/edit";
 const smallJson = express.json({ limit: "2mb" });
 app.use((req, res, next) => {
   // Understory's requests for a model carry whole conversations: its route reads its own.
-  if (UPLOAD_ROUTE.test(req.path) || PROMPT_ROUTE.test(req.path) || req.path === IMAGE_EDIT_ROUTE || req.path.startsWith("/understory-llm/")) return next();
+  // An extension's routes read their own as well, each as it needs: see extension-host.ts.
+  if (UPLOAD_ROUTE.test(req.path) || PROMPT_ROUTE.test(req.path) || req.path === IMAGE_EDIT_ROUTE || req.path.startsWith("/understory-llm/") || req.path.startsWith("/api/x/")) return next();
   smallJson(req, res, next);
 });
 app.use(cookieParser());
 
 // --- auth ---
 
-app.get("/api/auth/status", (req, res) => {
-  const authed = isAuthed(req);
-  // Said to a login only: to anyone else it would say which password to guess.
-  res.json({ authRequired: authEnabled, authed, ...(authed && keptShortPassword ? { shortPassword: true } : {}) });
+// Whether the portal is up, and which start of it answers: a page that asked for a restart waits for another one.
+// Open to anyone, as the login page is; the start's token says nothing a visitor could use.
+app.get("/api/health", (_req, res) => {
+  res.json({ ok: true, boot: LOG_BOOT });
 });
 
-app.post("/api/auth/login", loginThrottle(), (req, res) => {
-  if (!authEnabled) return res.json({ ok: true });
-  if (!checkPassword(req.body?.password)) {
+app.get("/api/auth/status", (req, res) => {
+  const authed = isAuthed(req);
+  const mode = authMode();
+  const sso = activeSso();
+  // `setup` says that no password has been chosen yet: the page asks for one instead of for the password.
+  // The warning about a short one is said to a login only: to anyone else it would say which password to guess.
+  res.json({
+    authRequired: mode !== "open",
+    authed,
+    ...(mode === "setup" ? { setup: true } : {}),
+    // What the login page offers besides the password: the provider's button, and whether it is the only way in.
+    ...(sso ? { oidc: { name: sso.name, only: sso.only } } : {}),
+    ...(authed && shortPassword() ? { shortPassword: true } : {}),
+  });
+});
+
+// One count of attempts for the password and the provider: a sign-in through it that fails counts like a wrong password.
+const loginAttempts = loginThrottle();
+
+app.post("/api/auth/login", loginAttempts, async (req, res) => {
+  const mode = authMode();
+  if (mode === "open") return res.json({ ok: true });
+  if (mode === "setup") return res.status(409).json({ error: "No password has been chosen yet.", setup: true });
+  if (passwordRefused()) return res.status(403).json({ error: `The password login is switched off. Sign in with ${activeSso()?.name}.` });
+  if (!(await checkPassword(req.body?.password))) {
     return res.status(401).json({ error: "Wrong password" });
   }
   issueCookie(res);
   res.json({ ok: true });
 });
 
-app.post("/api/auth/logout", (req, res) => {
-  signOut(req, res);
+// The first password, chosen by whoever opens a portal that has none yet: signed in with it at once.
+app.post("/api/auth/setup", async (req, res) => {
+  const refused = await setUpPassword(req.body?.password);
+  if (refused) return res.status(refused.status).json({ error: refused.error });
+  issueCookie(res);
   res.json({ ok: true });
+});
+
+// Throttled like the login, since it too takes a guess at the password. Every other login ends with the change,
+// and this browser is signed in again under the new one.
+app.post("/api/auth/password", requireAuth, loginThrottle(), async (req, res) => {
+  const refused = await changePassword(req.body?.current, req.body?.password);
+  if (refused) return res.status(refused.status).json({ error: refused.error });
+  issueCookie(res);
+  res.json({ ok: true });
+});
+
+app.post("/api/auth/logout", async (req, res) => {
+  signOut(req, res);
+  const endSession = await endSessionUrl();
+  res.json({ ok: true, ...(endSession ? { endSession } : {}) });
+});
+
+app.use(oidcRouter(loginAttempts));
+
+// Single sign-on under Settings → Authentication. The client secret is never sent back: the page is told only whether there is one.
+app.get("/api/auth/sso", requireAuth, (_req, res) => {
+  const config = ssoConfig();
+  res.json({ mode: authMode(), callbackPath: CALLBACK_PATH, settings: config ? shownForm(config) : null, only: config?.only ?? false });
+});
+
+/**
+ * Saves the provider's settings, or with `settings: null` takes single sign-on out. Asks for the current
+ * password, like changing it does: whoever saves chooses the provider that signs people in. The provider is read
+ * before anything is kept, so settings it does not answer to are refused with its reason. A change to the
+ * provider, or to whether the password may sign in, ends every other login; this browser is signed in again under it.
+ * Leaving `only` out keeps whether the password may sign in as it is.
+ */
+app.put("/api/auth/sso", requireAuth, loginThrottle(), async (req, res) => {
+  if (authMode() !== "password") return res.status(409).json({ error: "Single sign-on needs the portal's own password to be set." });
+  if (!(await checkPassword(req.body?.current))) return res.status(403).json({ error: "The current password is wrong." });
+  // Only a wrong password counts towards the throttle: settings refused after it are no guess at it.
+  res.locals.passwordRight = true;
+  const { settings, only } = req.body ?? {};
+  if (settings === null) {
+    removeSso();
+    sweep();
+    issueCookie(res);
+    return res.json({ settings: null, only: false });
+  }
+  if (only !== undefined && typeof only !== "boolean") return res.status(400).json({ error: "OIDC only must be on or off." });
+  const kept = ssoConfig();
+  const input = settings && typeof settings === "object" ? { ...settings } : settings;
+  // The secret kept is used again when none is typed, but only for the same provider and client: it is never sent to
+  // another. For another one, a secret left out is not taken as "none" either, which would quietly make the client
+  // a public one that the provider then refuses: it is to be typed again, or taken away on purpose (null).
+  if (input && typeof input === "object" && input.clientSecret === undefined && kept?.clientSecret) {
+    // Compared as they are kept, trimmed: a space pasted along with them is not another provider.
+    const trimmed = (value: unknown) => (typeof value === "string" ? value.trim() : value);
+    if (trimmed(input.issuer) !== kept.issuer || trimmed(input.clientId) !== kept.clientId) {
+      return res.status(400).json({ error: "The issuer or the client ID changed, so the kept client secret is not used for it. Type the client secret again, or remove it for a public client." });
+    }
+    input.clientSecret = kept.clientSecret;
+  }
+  let config;
+  try {
+    // A save that leaves `only` out keeps it as it is: a script that renames the button must not switch the password login back on.
+    config = parseOidcConfig(input, only === undefined ? kept?.only === true : only);
+  } catch (e) {
+    if (e instanceof OidcConfigError) return res.status(400).json({ error: e.message });
+    throw e;
+  }
+  let provider;
+  try {
+    provider = await discover(config);
+  } catch (e) {
+    return res.status(400).json({ error: (e as Error).message });
+  }
+  saveSso(config);
+  rememberProvider(provider);
+  sweep();
+  issueCookie(res);
+  res.json({ settings: shownForm(config), only: config.only, ...(config.endSession && !provider.endSessionEndpoint ? { noEndSession: true } : {}) });
 });
 
 // Understory's model server, in "the chat's" mode: its own token, not a portal login.
@@ -320,11 +455,18 @@ function workingIn<T extends { workspace: string }>(dir: string, rows: T[]): T[]
 app.get("/api/projects", (req, res) => {
   const home = agentHomePath();
   // Each agent's home is a folder of chats of its own, named after the agent.
-  const agents = listAgents().map((a) => ({ id: a.id, name: a.name, home: a.home }));
+  const fresh = newChatAgent().id;
+  const agents = listAgents().map((a) => ({ id: a.id, name: a.name, home: a.home, newChats: a.id === fresh }));
   try {
     if (!existsSync(WORKSPACE_ROOT)) return res.json({ root: WORKSPACE_ROOT, home, agents, projects: [] });
+    // The agent each project works with, where it still exists; a blank slate says nothing.
+    const links = projectAgents();
+    const linkOf = (name: string) => {
+      const id = links.get(name)?.agent;
+      return id && agents.some((a) => a.id === id) ? { agent: id } : {};
+    };
     if (req.query.bare === "1") {
-      return res.json({ root: WORKSPACE_ROOT, home, agents, projects: listProjects(WORKSPACE_ROOT).map((p) => ({ name: p.name, path: p.path })) });
+      return res.json({ root: WORKSPACE_ROOT, home, agents, projects: listProjects(WORKSPACE_ROOT).map((p) => ({ name: p.name, path: p.path, ...linkOf(p.name) })) });
     }
     // Read once, not once per project.
     const all = listSessions();
@@ -333,6 +475,8 @@ app.get("/api/projects", (req, res) => {
       const chats = chatsIn(p.path, all);
       return {
         ...p,
+        ...linkOf(p.name),
+        ...(links.get(p.name)?.understoryOff ? { understoryOff: true } : {}),
         hasTools: withTools.has(p.name),
         sessions: chats.length,
         lastActive: chats.reduce((latest, s) => (s.updated_at > latest ? s.updated_at : latest), "") || null,
@@ -368,6 +512,9 @@ app.post("/api/projects", (req, res) => {
   if (instructions !== undefined && typeof instructions !== "string") {
     return res.status(400).json({ error: "instructions must be text" });
   }
+  // Also checked before the folder is made, so that a refusal leaves no project behind.
+  const wanted = agentLinkOf(req.body);
+  if ("error" in wanted) return res.status(wanted.status).json({ error: wanted.error });
   if (toolsOff !== undefined) {
     if (!isToolList(toolsOff)) return res.status(400).json({ error: "toolsOff must be a list of tool names" });
     if (EXECUTOR_KIND === "container") return res.status(400).json(toolsUnsupported);
@@ -385,7 +532,76 @@ app.post("/api/projects", (req, res) => {
     } catch (e) {
       return res.json({ ...project, toolsError: (e as Error).message });
     }
+    // The same for the agent: a folder of this name left behind by an earlier project does not give its link to this one.
+    clearProjectAgent(project.name);
+    if (wanted.agent !== undefined || wanted.understory !== undefined) {
+      setProjectAgent(project.name, { agent: wanted.agent ?? "", understoryOff: wanted.understory === false });
+    }
     res.json(project);
+  } catch (e) {
+    projectFailure(res, e);
+  }
+});
+
+/**
+ * What a request says about the agent a project works with: `agent`, an
+ * agent's id or null (or "") for none, and `understory`, whether Understory is
+ * the project's memory. Either may be left out. An agent that does not exist
+ * is refused rather than stored: the project would be a blank slate and the
+ * page would not know why.
+ */
+function agentLinkOf(body: unknown): { agent?: string; understory?: boolean } | { error: string; status: number } {
+  const { agent, understory } = (body ?? {}) as { agent?: unknown; understory?: unknown };
+  if (agent !== undefined && agent !== null && typeof agent !== "string") return { error: "agent must be an agent's id, or null", status: 400 };
+  if (understory !== undefined && typeof understory !== "boolean") return { error: "understory must be true or false", status: 400 };
+  if (agent && !getAgent(agent)) return { error: "No such agent", status: 404 };
+  return { ...(agent !== undefined ? { agent: agent ?? "" } : {}), ...(understory !== undefined ? { understory } : {}) };
+}
+
+/** The agent a project works with and whether Understory is its memory, as its page shows them. */
+function agentOfProject(name: string) {
+  const link = projectAgent(name);
+  const agent = linkedAgent(name)?.id ?? null;
+  return {
+    agent,
+    // What the chats get (see understoryAt): a blank slate has no agent whose memory it would be, whatever the stored switch says.
+    understory: !!agent && !link.understoryOff,
+    // Whether the portal has Understory at all: without it there is nothing for the project to do without.
+    understoryAvailable: understoryOn(),
+  };
+}
+
+/**
+ * Which agent a project works with: its chats carry that agent's soul, its
+ * primary user and its memory as well as the project's AGENTS.md, and use its
+ * skills, voice and avatar. `agent: null` is a blank slate, which is what a
+ * project is until it says otherwise.
+ */
+app.get("/api/projects/:name/agent", (req, res) => {
+  try {
+    res.json(agentOfProject(getProject(WORKSPACE_ROOT, req.params.name).name));
+  } catch (e) {
+    projectFailure(res, e);
+  }
+});
+
+/**
+ * Change the agent a project works with, or whether Understory is its memory;
+ * what is left out stays. Chats already open pick it up after /reload, like
+ * the project's instructions.
+ */
+app.put("/api/projects/:name/agent", (req, res) => {
+  const wanted = agentLinkOf(req.body);
+  if ("error" in wanted) return res.status(wanted.status).json({ error: wanted.error });
+  if (wanted.agent === undefined && wanted.understory === undefined) return res.status(400).json({ error: "agent or understory required" });
+  try {
+    const project = getProject(WORKSPACE_ROOT, req.params.name);
+    const held = projectAgent(project.name);
+    setProjectAgent(project.name, {
+      agent: wanted.agent ?? held.agent,
+      understoryOff: wanted.understory === undefined ? held.understoryOff : !wanted.understory,
+    });
+    res.json(agentOfProject(project.name));
   } catch (e) {
     projectFailure(res, e);
   }
@@ -473,14 +689,17 @@ app.put("/api/projects/:name/tools", async (req, res) => {
  * layers under it say, which is what this one disagrees with. Shaped like a
  * project's and a chat's, so the page draws them all the same way.
  */
-function layerTools(folder: string, below: string[], exceptions: { off: string[]; on: string[] }) {
+function layerTools(folder: string, below: string[], exceptions: { off: string[]; on: string[] }, unwatched = false) {
   const servers = mcpServerNames();
+  const lazy = lazyMarks();
   return {
-    tools: shownTools(folder).map((tool) => ({
+    // A routine's runs have nobody to ask (see asksQuestions), so its page does not offer the tool.
+    tools: shownTools(folder).filter((tool) => !(unwatched && tool.name === ASK_QUESTION_TOOL && tool.inline)).map((tool) => ({
       ...tool,
       source: toolSource(tool.name, tool.source, servers),
       enabled: toolEnabled(tool.name, below, exceptions),
       defaultOn: !below.includes(tool.name),
+      ...lazy(tool),
     })),
     live: false,
     names: toolGroupNames(),
@@ -542,7 +761,7 @@ app.get("/api/routines/:id/tools", (req, res) => {
   if (!routine) return res.status(404).json({ error: "Not found" });
   if (EXECUTOR_KIND === "container") return res.status(400).json(toolsUnsupported);
   if ("error" in routine) return res.status(409).json({ error: routine.error });
-  res.json(layerTools(routine.folder, toolDefaultsFor(routine.folder, null, "routine"), routineTools(routine.slug)));
+  res.json(layerTools(routine.folder, toolDefaultsFor(routine.folder, null, "routine"), routineTools(routine.slug), true));
 });
 
 app.put("/api/routines/:id/tools", async (req, res) => {
@@ -631,7 +850,9 @@ app.delete("/api/projects/:name", async (req, res) => {
       deleteProjectFolder(WORKSPACE_ROOT, project.name);
       // The pictures of every chat that worked there, the routine runs the folder's removal leaves behind too: no file of them is left to show.
       forgetPicturesIn(project.path);
+      forgetVideosIn(project.path);
       clearProjectTools(project.name);
+      clearProjectAgent(project.name);
       const switchedOff = switchOffRoutines([...routines, ...late]);
       getDb().transaction(() => {
         for (const chat of chats) deleteSession(chat.id);
@@ -685,8 +906,13 @@ app.delete("/api/agents/:id", async (req, res) => {
       deleteAgent(agent.id, { deleteFolder: req.query.folder === "delete" });
       // What it said about tools: an agent made later under the same name starts from the default.
       clearAgentTools(agent.id);
+      // The projects that worked with it are blank slates again.
+      releaseProjectsOf(agent.id);
       // The pictures of every chat that worked there, the routine runs the folder's removal leaves behind too: no file of them is left to show.
-      if (req.query.folder === "delete") forgetPicturesIn(agent.home);
+      if (req.query.folder === "delete") {
+        forgetPicturesIn(agent.home);
+        forgetVideosIn(agent.home);
+      }
       deleteNotesOf(agent.id);
       // With its folder they have nowhere left to run, and an agent made under the
       // same name must not take them over. Kept with the folder, they stay, switched off.
@@ -728,6 +954,8 @@ const toApi = (s: ReturnType<typeof getSession> & {}) => ({
   ...s,
   pinned: Boolean(s.pinned),
   live: sessions.isRunning(s.id),
+  // The results flagged as a suspected prompt injection that the person trusted, for the chat to say so.
+  trustedResults: [...trustedResults(s.id)],
 });
 
 app.get("/api/sessions", (_req, res) => {
@@ -799,12 +1027,12 @@ app.post("/api/agent/sessions", (req, res) => {
 // --- the agent's home directory ---
 
 /**
- * The avatar voice mode shows for a chat (`?session=`): its agent's, and the
- * first agent's for a chat in a project, or without one.
+ * The avatar voice mode shows for a chat (`?session=`): its agent's, the one a
+ * chat in a project is linked to, and else the first agent's.
  */
 app.get("/api/agent/orb", (req, res) => {
   const session = typeof req.query.session === "string" ? getSession(req.query.session) : undefined;
-  res.json(orbOf(agentOf(session?.workspace) ?? defaultAgent()));
+  res.json(orbOf(agentFor(session?.workspace)));
 });
 
 app.post("/api/sessions", (req, res) => {
@@ -816,10 +1044,11 @@ app.post("/api/sessions", (req, res) => {
   // `agent` starts it in that agent's home.
   const agent = agentId === undefined ? undefined : typeof agentId === "string" ? getAgent(agentId) : undefined;
   if (agentId !== undefined && !agent) return res.status(404).json({ error: "No such agent" });
-  // Without either, a chat starts in Home: the first agent's own directory,
-  // where its SOUL.md, PrimaryUser.md and MEMORY.md are. Agents' homes are the
-  // only places outside the workspace root a chat may start.
-  const where = agent ? { path: agentHome(agent.home) } : workspace === undefined ? { path: agentHome() } : checkWorkspace(workspace);
+  // Without either, a chat starts in the home of the agent picked for new chats,
+  // the first agent's by default: the directory where its SOUL.md, PrimaryUser.md
+  // and MEMORY.md are. Agents' homes are the only places outside the workspace
+  // root a chat may start.
+  const where = agent ? { path: agentHome(agent.home) } : workspace === undefined ? { path: agentHome(newChatAgent().home) } : checkWorkspace(workspace);
   if ("error" in where) return res.status(400).json({ error: where.error });
   const resolved = where.path;
 
@@ -920,6 +1149,43 @@ const editFailure = (res: express.Response, e: unknown) => {
   if (!(e instanceof SessionEditError)) return res.status(500).json({ error: (e as Error).message });
   res.status(editStatus[e.code as keyof typeof editStatus] ?? 422).json({ error: e.message });
 };
+
+/**
+ * The person trusts a result the guard flagged as a suspected prompt injection
+ * in this conversation: it no longer holds the conversation back. Removing the
+ * turn it is in, the other way out, is the message removal below.
+ */
+app.post("/api/sessions/:id/flagged/:result/trust", (req, res) => {
+  const session = getSession(req.params.id);
+  if (!session) return res.status(404).json({ error: "No such conversation" });
+  if (!/^[0-9a-f]{16}$/.test(req.params.result)) return res.status(400).json({ error: "That is not a flagged result" });
+  trustFlagged(session.id, req.params.result);
+  recordAudit({ kind: "trusted", reason: "You looked at a result flagged as a suspected prompt injection and trusted it", sessionId: session.id });
+  res.json({ ok: true });
+});
+
+/**
+ * Takes back a message that was sent mid-run and that the agent has not read
+ * yet; 409 once it has. `/send` stops the run and sends it first instead, the
+ * others behind it in their order.
+ */
+app.delete("/api/sessions/:id/queued/:seq", async (req, res) => {
+  try {
+    await sessions.takeBackWaiting(req.params.id, Number(req.params.seq), false);
+    res.json({ ok: true });
+  } catch (e) {
+    editFailure(res, e);
+  }
+});
+
+app.post("/api/sessions/:id/queued/:seq/send", async (req, res) => {
+  try {
+    await sessions.takeBackWaiting(req.params.id, Number(req.params.seq), true);
+    res.json({ ok: true, status: "running" });
+  } catch (e) {
+    editFailure(res, e);
+  }
+});
 
 /** Removes a message and the agent's answer to it. */
 app.delete("/api/sessions/:id/messages/:seq", async (req, res) => {
@@ -1049,15 +1315,32 @@ app.get("/api/tools", (_req, res) => {
   if (EXECUTOR_KIND === "container") return res.status(400).json(toolsUnsupported);
   const off = new Set(toolDefaultsOff());
   const servers = mcpServerNames();
+  const lazy = lazyMarks();
   res.json({
-    tools: shownTools().map((tool) => ({
-      ...tool,
-      source: toolSource(tool.name, tool.source, servers),
-      defaultOn: !off.has(tool.name),
-    })),
+    tools: shownTools().map((tool) => {
+      const marks = lazy(tool);
+      return {
+        ...tool,
+        source: toolSource(tool.name, tool.source, servers),
+        defaultOn: !off.has(tool.name),
+        // Not offered one by one: found through the `tools` tool, or for an MCP server's tool through `mcp`, where `mcp` is the server whose setting says so.
+        ...marks,
+        // Neither marked nor set on a server: pi's own tools and the adapter's `mcp` tool, which the page offers no lazy mark for.
+        ...(lazyAllowed(tool, servers) || marks.mcp !== undefined ? {} : { noLazy: true as const }),
+      };
+    }),
     off: [...off].sort(),
     names: toolGroupNames(),
+    lazy: lazyToolSets(),
+    questionWaitMinutes: questionWaitMinutes(),
   });
+});
+
+/** How long the agent's ask_question waits for an answer: 0 is until it is answered. Read when a question is asked; the Tools page gets it with the tools. */
+app.put("/api/ask-question", (req, res) => {
+  const waitMinutes = setQuestionWaitMinutes(req.body?.waitMinutes);
+  if (waitMinutes === undefined) return res.status(400).json({ error: `waitMinutes must be one of ${QUESTION_WAIT_MINUTES.join(", ")}` });
+  res.json({ waitMinutes });
 });
 
 /** What each package is called here. Everything not named keeps its own name. */
@@ -1085,6 +1368,28 @@ app.put("/api/tools", async (req, res) => {
   const stored = setToolDefaultsOff(off);
   const applied = await sessions.applyToolDefaults();
   res.json({ off: stored, applied });
+});
+
+/**
+ * Which tools are lazy: tool sets, named as the boxes of the tools list name them, and single tools
+ * (`<tool>name`). A lazy tool is on like any other, but is not in the model's prompt: it finds it
+ * through the `tools` tool. The marks reach the running conversations too. An MCP server's tools are
+ * lazy by the server's own setting (`PUT /api/mcp/servers/:name/direct`) and pi's own cannot be lazy,
+ * and a mark that names them is refused.
+ */
+app.put("/api/tools/lazy", async (req, res) => {
+  if (EXECUTOR_KIND === "container") return res.status(400).json(toolsUnsupported);
+  const lazy = req.body?.lazy;
+  if (!isToolList(lazy)) return res.status(400).json({ error: "lazy must be a list of tool set names" });
+  // Only what is new is checked: a mark kept from before must not stand in the way of an unrelated change.
+  const before = lazyToolSets();
+  const refused = lazyRefused(lazy.filter((mark) => !before.includes(mark)));
+  if (refused.length) {
+    return res.status(400).json({ error: `Cannot be lazy: ${refused.join(", ")}. An MCP server's tools are lazy by the server's own setting (Register tools directly), and pi's built-in tools are always offered.`, code: "lazy-refused" });
+  }
+  const stored = setLazyToolSets(lazy);
+  const applied = await sessions.applyToolDefaults();
+  res.json({ lazy: stored, applied });
 });
 
 app.post("/api/sessions/:id/abort", async (req, res) => {
@@ -1148,6 +1453,33 @@ app.post("/api/sessions/:id/subagents/:agent/stop", (req, res) => {
     return res.status(409).json({ error: "The subagent cannot be reached: it is not running any more, or the chat is not running here" });
   }
   res.json({ ok: true });
+});
+
+// What an extension's server half tells a page that opens this chat, asked for by a browser half that came into the
+// page after the chat's stream had opened: see extension-host.ts.
+app.get("/api/sessions/:id/extension-ui", (req, res) => {
+  const session = getSession(req.params.id);
+  if (!session) return res.status(404).json({ error: "Not found" });
+  const extension = typeof req.query.extension === "string" ? req.query.extension : "";
+  if (!extension) return res.status(400).json({ error: "Which extension it is for is missing" });
+  res.json({ pushes: openingFor(session.id, extension) });
+});
+
+// What an extension's browser half says to its own half in this chat: see extension-ui.ts.
+app.post("/api/sessions/:id/extension-ui", async (req, res) => {
+  const session = getSession(req.params.id);
+  if (!session) return res.status(404).json({ error: "Not found" });
+  const extension = typeof req.body?.extension === "string" ? req.body.extension : "";
+  if (!extension) return res.status(400).json({ error: "Which extension it is for is missing" });
+  try {
+    if (!(await sessions.tellExtension(session.id, extension, req.body.data ?? null))) {
+      return res.status(409).json({ error: "The extension cannot be reached: this chat's agent does not run its extensions here" });
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(`[portal] could not reach an extension of ${session.id}:`, e);
+    res.status(500).json({ error: (e as Error).message });
+  }
 });
 
 // --- per-session config (the web equivalent of the TUI's slash commands) ---
@@ -1427,6 +1759,7 @@ app.use("/api", packagesRouter());
 app.use("/api", extensionsRouter());
 app.use("/api", featuresRouter());
 app.use("/api", imagesRouter());
+app.use("/api", videosRouter());
 app.use("/api", memoryRouter());
 app.use("/api", channelsRouter());
 app.use("/api", agentsRouter());
@@ -1448,9 +1781,14 @@ app.use("/api", providersRouter());
 app.use("/api", peopleRouter());
 app.use("/api", browserRouter());
 app.use("/api", sandboxRouter(sessions));
+app.use("/api", logsRouter());
+app.use("/api", updateRouter());
+app.use("/api", restartRouter());
 app.use("/api", voiceRouter());
 app.use("/api", terminalRouter());
 app.use("/api", canvasesRouter());
+// The routes of the installed extensions' server halves, each under its package's name.
+app.use("/api/x", extensionRoutes);
 // Before the SPA fallback, which answers everything that is not /api.
 mountBrowserProxy(app);
 
@@ -1518,7 +1856,7 @@ const tls =
     ? { cert: readFileSync(tlsAt.cert), key: readFileSync(tlsAt.key) }
     : null;
 
-const host = bindHost(process.env.PORTAL_PASSWORD, process.env.ALLOW_OPEN);
+const host = bindHost(authMode() !== "open", process.env.ALLOW_OPEN);
 // Before anything can start a run: a catch-up routine marked running in the same
 // moment would be taken for one the last server left.
 const cutOff = sessions.recoverOrphans();
@@ -1530,10 +1868,18 @@ const server = (tls ? createHttpsServer(tls, app) : createHttpServer(app)).liste
   console.log(`  local bin: ${BIN_DIR}`);
   console.log(`  executor: ${EXECUTOR_KIND}`);
   console.log(`  workspaces: ${WORKSPACE_ROOT}`);
-  console.log(`  auth:     ${authEnabled ? "password" : "DISABLED"}`);
+  console.log(`  auth:     ${{ password: "password", setup: "waiting for a password to be chosen", open: "DISABLED" }[authMode()]}`);
+  const sso = activeSso();
+  if (sso) {
+    console.log(`  sso:      ${sso.issuer}${sso.only ? " (the only way in: the password login is off)" : ""}`);
+    // Read now, so that a provider that does not answer is in the log before anyone presses the button.
+    providerFor(sso).catch((e) => console.error(`[auth] single sign-on cannot reach ${sso.issuer}: ${(e as Error).message}. Sign-ins through it fail until it can.`));
+  }
 
   // Recurring schedules wait for their next slot; overdue one-off routines catch up.
   routineSupervisor.start();
+  // Looks at origin/main for new commits, now and every six hours: only where there is a checkout to update.
+  startUpdateChecks();
   // Agents with a heartbeat look around on their own, when nothing else is using the model.
   heartbeat.start();
 
@@ -1580,6 +1926,9 @@ sessions.startReaper();
 sweepRemoved(WORKSPACE_ROOT);
 sweepRemoved(agentsRoot());
 interruptCanvasWrites();
+// The server halves of the installed extensions: see extension-host.ts.
+void noteLoadedExtensions();
+void syncExtensionServers().catch((e) => console.error("[extensions] could not start the server halves:", e));
 pinConnection();
 adoptPortalBrowser();
 // The sandbox's sudo rules live outside the data volume, so a new container needs them put back.
@@ -1608,18 +1957,20 @@ function shutdown(signal: string): Promise<void> {
 async function stop(signal: string) {
   console.log(`${signal} received — stopping running sessions`);
   // However long the rest takes, and no longer than docker waits before it kills.
-  setTimeout(() => process.exit(0), 10_000).unref();
+  setTimeout(() => process.exit(requestedExit()), 10_000).unref();
   routineSupervisor.stop();
   // Alongside the rest: their shells are given a moment to wind down.
   const shells = endAllTerminals();
   await channelSupervisor.shutdown();
   await sessions.shutdown();
+  // After the chats: a chat's pi may still be using what a server half holds.
+  await stopServerHalves();
   await shells;
-  server.close(() => process.exit(0));
+  server.close(() => process.exit(requestedExit()));
   // Every open page holds an event stream that never ends by itself, and
   // close() waits for them — so a restart always sat out the full ten seconds
-  // of the timer above.
-  server.closeAllConnections();
+  // of the timer above. A request that is being answered gets a moment first.
+  closeConnections(server, 2000);
 }
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
 process.on("SIGINT", () => void shutdown("SIGINT"));

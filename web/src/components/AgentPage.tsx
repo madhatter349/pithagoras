@@ -27,7 +27,7 @@ import { AgentSetup } from "./AgentSetup";
 import { ToolSwitches } from "./ToolSwitches";
 import { confirmDeleteSession } from "./SessionActions";
 import { Modal } from "./Modal";
-import { ErrorBanner, LoadFailed, primarySmCls } from "./SettingsUi";
+import { ErrorBanner, LoadFailed, Switch, primarySmCls } from "./SettingsUi";
 import { StatusDot } from "./StatusDot";
 import { TitleInput } from "./TitleInput";
 import { pollWhileVisible } from "../poll";
@@ -41,7 +41,16 @@ import { when } from "../time";
  * another. A card opens that agent (`?agent=`), with its own home, files and
  * conversations.
  */
-export function AgentPage({ onSelect, onNewChat }: { onSelect: (id: string) => void; onNewChat: (workspace: string) => Promise<void> }) {
+export function AgentPage({
+  onSelect,
+  onNewChat,
+  reloadPlaces,
+}: {
+  onSelect: (id: string) => void;
+  onNewChat: (workspace: string) => Promise<void>;
+  /** The sidebar's places load again: it shows which agent New starts chats with, and groups by agent once there is more than one. */
+  reloadPlaces: () => void;
+}) {
   const [params, setParams] = useSearchParams();
   const [agents, setAgents] = useState<Agent[] | null>(null);
   const [creating, setCreating] = useState(false);
@@ -80,6 +89,7 @@ export function AgentPage({ onSelect, onNewChat }: { onSelect: (id: string) => v
           onSubmit={async (input) => {
             const made = await api.createAgent(input);
             await loadAgents();
+            reloadPlaces();
             setMadeKept({ id: made.id, files: answersLeft(made.kept) });
             setCreating(false);
             setParams({ agent: made.id });
@@ -116,8 +126,13 @@ export function AgentPage({ onSelect, onNewChat }: { onSelect: (id: string) => v
         </button>
       }
       onChanged={loadAgents}
+      onPickChanged={async () => {
+        await loadAgents();
+        reloadPlaces();
+      }}
       onDeleted={async () => {
         await loadAgents();
+        reloadPlaces();
         setParams({});
       }}
       onSelect={onSelect}
@@ -200,6 +215,7 @@ function AgentView({
   onKept,
   back,
   onChanged,
+  onPickChanged,
   onDeleted,
   onSelect,
   onNewChat,
@@ -210,6 +226,8 @@ function AgentView({
   onKept: (files: string[]) => void;
   back: ReactNode;
   onChanged: () => Promise<void>;
+  /** The "New chats start here" switch was used: the sidebar's house follows it. */
+  onPickChanged: () => Promise<void>;
   onDeleted: () => Promise<void>;
   onSelect: (id: string) => void;
   /** A chat started in the agent's home, as the + in the sidebar starts one: listed in the sidebar and opened. */
@@ -437,6 +455,24 @@ function AgentView({
                 <LuUser className="h-3 w-3 shrink-0 text-fg-faint" />
                 <span className="truncate font-mono text-[11px] text-fg-subtle">{agent.sandboxUser}</span>
               </div>
+              <div className="flex min-w-0 items-center gap-2 rounded-lg bg-raised/60 px-2.5 py-1" title={t("The New button starts its chats with this agent")}>
+                <span className="truncate text-[11px] text-fg-subtle">{t("New chats start here")}</span>
+                <Switch
+                  on={agent.newChats}
+                  // The first agent takes new chats back when no other has them: it is turned on from another's page, not off.
+                  disabled={agent.newChats && agent.first}
+                  label={t("New chats start here")}
+                  onChange={async (on) => {
+                    setError("");
+                    try {
+                      await api.setNewChats(agent.id, on);
+                      await onPickChanged();
+                    } catch (e) {
+                      setError((e as Error).message);
+                    }
+                  }}
+                />
+              </div>
             </div>
           </PageHeader>
 
@@ -609,7 +645,7 @@ type AgentTab = (typeof AGENT_TABS)[number][0];
 /** The tabs under an agent's header; Activity counts what is unread. */
 function AgentTabs({ tab, onTab, unread }: { tab: AgentTab; onTab: (id: AgentTab) => void; unread: number }) {
   return (
-    <div role="tablist" aria-label={t("Agent sections")} onKeyDown={tabKeys} className="mt-5 flex gap-1 overflow-x-auto border-b border-line">
+    <div role="tablist" aria-label={t("Agent sections")} onKeyDown={tabKeys} className="mt-5 flex gap-1 overflow-x-auto overflow-y-hidden border-b border-line">
       {AGENT_TABS.map(([id, label]) => (
         <button
           key={id}

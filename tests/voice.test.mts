@@ -10,7 +10,7 @@ const dir = inProcessHome('pithagoras-voice-');
 process.env.DOCKER_SOCKET = join(dir, 'no-docker.sock');
 const { voiceRouter, pcmWav, wavPcm, validateConfig, connectManagedVoice, errorLineRetry } = await import('../server/src/api/voice.js');
 const { INPUT_LANGUAGES, CHATTERBOX_LANGUAGES } = await import('../server/src/voice-languages.js');
-const { getDb, getSkipThinkingProviders, getVoiceInstructions } = await import('../server/src/db.js');
+const { getDb, getSkipThinkingProviders, getVoiceInstructions, getVoiceModel } = await import('../server/src/db.js');
 const { DEFAULT_SKIP_THINKING_PROVIDERS, DEFAULT_VOICE_INSTRUCTIONS } = await import('../server/src/pi/voice-first.js');
 const upstream = express();
 let calls = 0;
@@ -30,6 +30,11 @@ upstream.post('/inference', express.raw({ type: () => true }), (req, res) => {
   transcriptionBody = req.body.toString();
   calls++; assert.match(transcriptionBody, /name="file"; filename="recording.wav"/);
   res.json({ text: ' Test the session. ' });
+});
+let dictationBody = "";
+upstream.post('/dictation', express.raw({ type: () => true }), (req, res) => {
+  dictationBody = req.body.toString();
+  res.json({ text: ' Dictated elsewhere. ' });
 });
 upstream.post('/v1/audio/speech', express.raw({ type: () => true }), async (req, res) => {
   speechCalls++;
@@ -99,6 +104,59 @@ test('voice is opt-in, checks session existence, and proxies actual multipart co
 test('a voice that is not in the library is refused rather than spoken in another', () => {
   assert.throws(() => validateConfig({ ...settings, voice: 'missing' }));
   assert.throws(() => validateConfig({ ...settings, voice: '../other' }));
+});
+test('dictation can name a model of its own; voice mode and an empty setting keep the general one', async () => {
+  const put = (body: object) => fetch(`${base}/voice`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const transcribe = async (query = '') => {
+    const res = await fetch(`${base}/sessions/test/voice/transcribe${query}`, { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: new Uint8Array(pcmWav(Buffer.alloc(32))) });
+    assert.equal(res.status, 200);
+    return transcriptionBody.match(/name="model"\r\n\r\n(.*)\r\n/)?.[1];
+  };
+  const saved = await put({ ...settings, sttModel: 'fast-asr', dictationModel: ' accurate-asr ' });
+  assert.equal(saved.status, 200);
+  assert.equal((await saved.json()).dictationModel, 'accurate-asr');
+  assert.equal(await transcribe(), 'fast-asr');
+  assert.equal(await transcribe('?purpose=dictation'), 'accurate-asr');
+  // "Auto": empty means dictation uses the general model.
+  assert.equal((await put({ ...settings, sttModel: 'fast-asr', dictationModel: '' })).status, 200);
+  assert.equal(await transcribe('?purpose=dictation'), 'fast-asr');
+  // Only the dictation model is set: voice mode sends no model field.
+  assert.equal((await put({ ...settings, sttModel: '', dictationModel: 'accurate-asr' })).status, 200);
+  assert.equal(await transcribe(), undefined);
+  assert.equal(await transcribe('?purpose=dictation'), 'accurate-asr');
+  assert.throws(() => validateConfig({ ...settings, dictationModel: 'a model' }));
+  assert.throws(() => validateConfig({ ...settings, dictationModel: 3 }));
+  // The managed service names its own model, so a leftover one is dropped.
+  assert.equal(connectManagedVoice().dictationModel, '');
+});
+test('dictation can name an endpoint of its own; voice mode and an empty setting keep the voice one', async () => {
+  const put = (body: object) => fetch(`${base}/voice`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const transcribe = async (query = '') => {
+    transcriptionBody = dictationBody = '';
+    const res = await fetch(`${base}/sessions/test/voice/transcribe${query}`, { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: new Uint8Array(pcmWav(Buffer.alloc(32))) });
+    assert.equal(res.status, 200);
+    return { text: (await res.json()).text, voice: transcriptionBody !== '', own: dictationBody !== '' };
+  };
+  const own = `http://127.0.0.1:${port}/dictation`;
+  const saved = await put({ ...settings, dictationUrl: ` ${own} ` });
+  assert.equal(saved.status, 200);
+  assert.equal((await saved.json()).dictationUrl, own);
+  // Dictation goes to its own address; voice mode keeps the general one.
+  assert.deepEqual(await transcribe('?purpose=dictation'), { text: 'Dictated elsewhere.', voice: false, own: true });
+  assert.deepEqual(await transcribe(), { text: 'Test the session.', voice: true, own: false });
+  // Empty: dictation uses the voice address like voice mode.
+  assert.equal((await put({ ...settings, dictationUrl: '' })).status, 200);
+  assert.deepEqual(await transcribe('?purpose=dictation'), { text: 'Test the session.', voice: true, own: false });
+  assert.equal((await put({ ...settings })).status, 200);
+  assert.deepEqual(await transcribe('?purpose=dictation'), { text: 'Test the session.', voice: true, own: false });
+  // The same check as for the voice address.
+  for (const bad of ['not a url', 'ftp://example.test/x', 'http://user:pw@example.test/x', 'http://example.test/x#frag'])
+    assert.throws(() => validateConfig({ ...settings, dictationUrl: bad }), undefined, bad);
+  assert.throws(() => validateConfig({ ...settings, dictationUrl: 3 }));
+  assert.equal(validateConfig({ ...settings, dictationUrl: '  ' }).dictationUrl, '');
+  // The managed service has one address for both, so a leftover one is dropped.
+  await put({ ...settings, dictationUrl: own });
+  assert.equal(connectManagedVoice().dictationUrl, '');
 });
 test('selected input language is sent to Whisper and invalid languages are rejected', async () => {
   for (const language of ['en', 'hi', 'bn']) {
@@ -700,6 +758,24 @@ test('the providers that skip thinking on the first spoken call: the default lis
   assert.equal(getSkipThinkingProviders(), undefined);
   // What is not a list of provider names.
   for (const bad of ['llama-swap', [42], ['two words'], ['a/b'], Array(51).fill('x')]) assert.equal((await put(bad)).status, 400, JSON.stringify(bad).slice(0, 40));
+  await put(undefined);
+});
+test('the voice model: none by default, a provider/model is saved and read back, and anything else is refused', async () => {
+  const put = (voiceModel: unknown) => fetch(`${base}/voice`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...settings, voiceModel }) });
+  await put(undefined);
+  assert.equal(getVoiceModel(), undefined);
+  assert.equal((await put(' fast/small-model:q4 ')).status, 200);
+  assert.deepEqual(getVoiceModel(), { provider: 'fast', modelId: 'small-model:q4' });
+  assert.equal(((await (await fetch(`${base}/voice`)).json()) as any).voiceModel, 'fast/small-model:q4');
+  // Kept when the managed voice saves the settings again.
+  assert.equal(connectManagedVoice().voiceModel, 'fast/small-model:q4');
+  // A model id may hold slashes of its own: only the first one ends the provider.
+  await put('router/vendor/model');
+  assert.deepEqual(getVoiceModel(), { provider: 'router', modelId: 'vendor/model' });
+  // Empty is the way back to the chat's own.
+  await put('');
+  assert.equal(getVoiceModel(), undefined);
+  for (const bad of [42, 'no-slash', '/model', 'provider/', 'two words/model', 'x'.repeat(301)]) assert.equal((await put(bad)).status, 400, JSON.stringify(bad).slice(0, 40));
   await put(undefined);
 });
 test('VOICE_RESPONSE_INSTRUCTIONS=false is shown to the page, and leaves a saved text alone', async () => {

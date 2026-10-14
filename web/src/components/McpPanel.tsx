@@ -18,7 +18,7 @@ import {
   LuTriangleAlert,
 } from "react-icons/lu";
 import { api, type McpConfigView, type McpServerEntry, type McpServerView } from "../api";
-import { Field, LoadFailed, Segments, btnCls, codeAreaCls, inputCls, primaryCls, primarySmCls } from "./SettingsUi";
+import { Field, LoadFailed, Segments, btnCls, codeAreaCls, gridCls, inputCls, primaryCls, primarySmCls } from "./SettingsUi";
 import { msg, t, tx } from "../i18n";
 
 
@@ -219,7 +219,7 @@ export function McpPanel({ onError }: { onError: (e: string) => void }) {
             {t("No servers yet. Most MCP projects publish a JSON snippet in their README — paste it straight in.")}
           </p>
         ) : (
-          <ul className="space-y-1.5">
+          <ul className={gridCls}>
             {view.servers.map((s) => (
               <ServerRow
                 key={s.name}
@@ -641,7 +641,7 @@ function ServerForm({
             checked={directTools}
             onChange={setDirectTools}
             label={t("Register tools directly")}
-            hint={t("Puts every tool in the system prompt instead of behind the proxy — 150–300 tokens each, so keep it to small servers")}
+            hint={t("Puts every tool in the system prompt instead of behind the proxy — 150–300 tokens each, so keep it to small servers. Off, the tools are lazy, as the lazy button of the server in Settings → Tools says.")}
           />
           <Toggle checked={debug} onChange={setDebug} label={t("Show server stderr")} />
           <Toggle

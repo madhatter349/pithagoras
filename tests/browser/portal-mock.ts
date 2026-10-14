@@ -46,7 +46,7 @@ export type Answer = unknown | Reply | typeof HANG | typeof DONE;
 
 /**
  * What every portal says unless a test says otherwise: signed in without a password, no chats, and the three things the
- * shell asks of every page (the add-on flags, the browser add-on, the voice add-on, the places for a new chat) and of
+ * shell asks of every page (the add-on flags, the browser add-on, the voice add-on, which extensions draw in it, the places for a new chat) and of
  * every chat (what runs in the background, what came before), with nothing set up.
  */
 const portalBase = ({ path, method, url }: Ask): Answer => {
@@ -56,9 +56,12 @@ const portalBase = ({ path, method, url }: Ask): Answer => {
   if (path === '/api/features/flags') return { subagent: { enabled: false }, understory: { enabled: false }, images: { enabled: false } };
   if (path === '/api/browser') return {
     running: false, unprotected: false, connectedAs: null, install: { available: false, image: false, container: 'absent', pulling: { active: false, line: '' } },
-    config: { user: '', hasPassword: false }, version: null, pages: [], uiPort: '', cursor: true, allowlist: '', configured: false, byDefault: true, sessions: [], routines: [],
+    config: { user: '', hasPassword: false }, version: null, pages: [], uiPort: '', uiExposed: false, uiOutdated: false, cursor: true, allowlist: '', configured: false, byDefault: true, sessions: [], routines: [],
   };
   if (path === '/api/voice') return { enabled: false };
+  if (path === '/api/extension-ui') return { extensions: [] };
+  // A portal that is not run from a checkout: nothing to update, no notice.
+  if (path === '/api/update') return { kind: 'none', boot: 'boot-a' };
   if (/^\/api\/sessions\/[^/]+\/background$/.test(path)) return { supported: true, jobs: [], statuses: [], widgets: [] };
   if (/^\/api\/sessions\/[^/]+\/events\/before$/.test(path)) return { events: [], more: false };
   if (path === '/api/projects' && url.searchParams.has('bare')) return { root: '/w', home: '/h', projects: [] };
@@ -77,9 +80,12 @@ const settingsBase = ({ path, method }: Ask): Answer => {
   if (path === '/api/providers') return { presets: [], apis: ['openai-completions'], hosted: [], providers: [] };
   if (path === '/api/routines/report-targets') return { targets: [], default: null };
   if (path === '/api/extensions') return { settingsPath: '/a/settings.json', extensions: [] };
+  if (path === '/api/extensions/shipped') return { extensions: [] };
   if (path === '/api/tool-names') return { names: {} };
   if (path === '/api/packages/catalog') return { packages: [] };
   if (path === '/api/workspaces') return { root: '/w', workspaces: [] };
+  // About asks whether the portal can restart itself.
+  if (path === '/api/restart') return { possible: true, by: 'systemd', running: 0, loaded: [], keepsLogins: true };
   return undefined;
 };
 

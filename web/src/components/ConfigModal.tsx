@@ -4,15 +4,16 @@ import {
   LuBlocks,
   LuBrain,
   LuCheck,
-  LuDownload,
+  LuScrollText,
   LuExternalLink,
   LuEye,
   LuFileJson,
   LuFolder,
   LuHammer,
   LuShieldCheck,
-  LuImage,
+  LuImages,
   LuInfo,
+  LuKeyRound,
   LuKeyboard,
   LuMonitor,
   LuMoon,
@@ -25,7 +26,6 @@ import {
   LuServer,
   LuSlidersHorizontal,
   LuSun,
-  LuTrash2,
   LuTriangleAlert,
   LuUsers,
 } from "react-icons/lu";
@@ -33,40 +33,55 @@ import { api, SIGNED_OUT, type AvailableModel, type ExtensionInfo, type GlobalSe
 import { ChannelsPanel } from "./ChannelsPanel";
 import { SkillsPanel } from "./SkillsPanel";
 import { McpPanel } from "./McpPanel";
+import { LogsPanel } from "./LogsPanel";
+import { PasswordPanel } from "./PasswordPanel";
+import { SsoPanel } from "./SsoPanel";
 import { parseWindow } from "../context-window";
 import { KeepRecent, useKeepRecentSave } from "./KeepRecent";
 import { formatTokens } from "../transcript";
-import { displayName } from "../tool-groups";
 import { useAsksBeforeDeleting } from "../confirm-prefs";
 import { useAnimations } from "../motion";
 import { useNotifyState } from "../notify";
 import { setCommandTrigger, typedCharacter, useCommandTrigger, validTrigger } from "../command-trigger";
 import { DEFAULT_TRIGGER } from "../slash-palette";
 import { PeoplePanel } from "./PeoplePanel";
-import { PicturesPanel } from "./PicturesPanel";
+import { MediaPanel } from "./MediaPanel";
 import { PortalExtensions } from "./PortalExtensions";
+import { RestartSection } from "./RestartSection";
+import { UpdateSection } from "./UpdateSection";
 import { Modal, useUnsavedDraft } from "./Modal";
 import { ToolDefaults } from "./ToolDefaults";
 import { SandboxSettings } from "./SandboxSettings";
 import { isEnter } from "../shortcuts";
 import { KeyboardShortcuts } from "./KeyboardShortcuts";
 import { ProvidersPanel } from "./ProvidersPanel";
-import { EffortPicker, Empty, ErrorBanner, LoadFailed, Section, Switch, SwitchRow, btnCls, inputCls, primaryCls } from "./SettingsUi";
-import { confirmDialog } from "./ConfirmDialog";
-import { PackageCatalog } from "./PackageCatalog";
-import { packageName, webLink } from "../package-names";
+import { EffortPicker, Empty, ErrorBanner, Field, LoadFailed, Section, Switch, SwitchRow, btnCls, inputCls, primaryCls } from "./SettingsUi";
+import { ExtensionsPanel } from "./ExtensionsPanel";
+import { webLink } from "../package-names";
 import { prefetchSettings, refreshFailed, useCached } from "../settings-cache";
 import type { Tab } from "../settings-tabs";
 import { serialSaver } from "../serial-saver";
 import { local } from "../safe-storage";
 import { SETTINGS_INDEX, searchSettings, type SettingEntry } from "../settings-search";
-import { useTheme, type Theme } from "../theme";
+import { usePalette, useTheme, type Theme } from "../theme";
+import { choose as chooseTheme, useThemes } from "../extensions/themes";
 import { humanKey, typed } from "../setting-values";
 import { effortLabel } from "../effort";
 import { modelTraits } from "../model-traits";
 import { languageChoice, languages, msg, setLanguage, t, tp, tx, useLanguage, type LanguageChoice } from "../i18n";
+import { ErrorBoundary, PartFailed } from "./ErrorBoundary";
+import { useSlot } from "../extensions/slots";
 import { SkeletonGroup } from "./Skeleton";
 import { useFlash } from "../use-flash";
+
+/**
+ * The pages that lay out the width of the dialog themselves: a grid of
+ * packages, lines of a log, a file to edit. Every other page takes the width
+ * too, and where the dialog is very wide its sections stand two abreast
+ * (`settings-flow`, in shell.css): a field across all of a wide screen is
+ * harder to read than two columns of them.
+ */
+const OWN_LAYOUT = new Set<Tab>(["extensions", "logs", "advanced"]);
 
 /** Either a fixed tab or one extension's own configuration page. */
 type Nav = { kind: "tab"; id: Tab } | { kind: "ext"; spec: string };
@@ -91,7 +106,7 @@ const GROUPS: { label: string; tabs: TabDef[] }[] = [
     tabs: [
       { id: "tools", label: msg("Tools"), icon: <LuHammer />, hint: msg("What the agent may reach for, by default") },
       { id: "sandbox", label: msg("Sandbox"), icon: <LuShieldCheck />, hint: msg("What the agent may read, change and run") },
-      { id: "images", label: msg("Images"), icon: <LuImage />, hint: msg("The image model behind making and changing pictures") },
+      { id: "media", label: msg("Media"), icon: <LuImages />, hint: msg("The image and video models behind making pictures and videos") },
       { id: "skills", label: msg("Skills"), icon: <LuWrench />, hint: msg("Procedures the agent can reach for") },
       { id: "mcp", label: msg("MCP"), icon: <LuPlug />, hint: msg("Servers the agent can pull tools from") },
       { id: "extensions", label: msg("Extensions"), icon: <LuBlocks />, hint: msg("Install and manage packages") },
@@ -108,8 +123,10 @@ const GROUPS: { label: string; tabs: TabDef[] }[] = [
     label: msg("Portal"),
     tabs: [
       { id: "browser", label: msg("This browser"), icon: <LuMonitor />, hint: msg("Theme, notifications, confirmations") },
+      { id: "authentication", label: msg("Authentication"), icon: <LuKeyRound />, hint: msg("The password, and signing in through a provider") },
       { id: "add-ons", label: msg("Add-ons"), icon: <LuPuzzle />, hint: msg("Optional parts of the portal itself") },
       { id: "shortcuts", label: msg("Shortcuts"), icon: <LuKeyboard />, hint: msg("Keyboard shortcuts, and changing them") },
+      { id: "logs", label: msg("Logs"), icon: <LuScrollText />, hint: msg("What the server prints, and a file to take away") },
       { id: "about", label: msg("About"), icon: <LuInfo />, hint: msg("Where this portal keeps things") },
       { id: "advanced", label: msg("Advanced"), icon: <LuFileJson />, hint: msg("pi's raw settings file") },
     ],
@@ -163,7 +180,10 @@ export const ConfigModal = memo(function ConfigModal({
   const section = nav.kind === "tab" ? nav.id : nav.spec;
   useEffect(() => setError(null), [section]);
 
-  const configurable = exts.value ? extensions.filter((e) => e.settings.length > 0) : railSnapshot().map((e) => ({ ...e, settings: [] as ExtensionInfo["settings"], placeholder: true }));
+  // A package has a page here when the portal found settings it reads, or when it brought a page of its own.
+  const settingsPages = useSlot("settings.page");
+  const hasPage = (e: ExtensionInfo) => e.settings.length > 0 || settingsPages.some((page) => page.extension === e.name);
+  const configurable = exts.value ? extensions.filter(hasPage) : railSnapshot().map((e) => ({ ...e, settings: [] as ExtensionInfo["settings"], placeholder: true }));
   useEffect(() => {
     if (!exts.value) return;
     // Only a head start for next time.
@@ -216,6 +236,8 @@ export const ConfigModal = memo(function ConfigModal({
     const seek = () => {
       const el = findSection(page.current, target.section);
       if (el) {
+        // A section that is closed opens for it, and so does the one a group in it is in (see CollapsibleSection).
+        el.dispatchEvent(new Event("settings-reveal", { bubbles: true }));
         el.scrollIntoView({ block: "start", behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
         el.classList.remove("setting-flash");
         void el.offsetWidth;
@@ -275,17 +297,19 @@ export const ConfigModal = memo(function ConfigModal({
     >
       {error && <ErrorBanner ref={banner} className="mb-4" onClose={() => setError(null)}>{error}</ErrorBanner>}
 
-      <div key={section} ref={page} className="settings-page">
+      <div key={section} ref={page} className={`settings-page${nav.kind === "tab" && OWN_LAYOUT.has(nav.id) ? "" : " settings-flow"}`}>
       {nav.kind === "tab" && nav.id === "models" && <ProvidersPanel onError={setError} onSetup={onSetup} />}
       {nav.kind === "tab" && nav.id === "general" && <GeneralPanel onError={setError} onProviders={() => setNav({ kind: "tab", id: "models" })} />}
       {nav.kind === "tab" && nav.id === "browser" && <BrowserPanel onError={setError} />}
+      {nav.kind === "tab" && nav.id === "authentication" && <><PasswordPanel /><SsoPanel /></>}
+      {nav.kind === "tab" && nav.id === "logs" && <LogsPanel onError={setError} />}
       {nav.kind === "tab" && nav.id === "about" && <AboutPanel onError={setError} />}
       {nav.kind === "tab" && nav.id === "channels" && <ChannelsPanel onError={setError} />}
       {nav.kind === "tab" && nav.id === "people" && <PeoplePanel onError={setError} />}
       {nav.kind === "tab" && nav.id === "add-ons" && <PortalExtensions onError={setError} />}
       {nav.kind === "tab" && nav.id === "tools" && <ToolDefaults onError={setError} />}
       {nav.kind === "tab" && nav.id === "sandbox" && <SandboxSettings onError={setError} />}
-      {nav.kind === "tab" && nav.id === "images" && <PicturesPanel onError={setError} />}
+      {nav.kind === "tab" && nav.id === "media" && <MediaPanel onError={setError} />}
       {nav.kind === "tab" && nav.id === "skills" && <SkillsPanel onError={setError} />}
       {nav.kind === "tab" && nav.id === "mcp" && <McpPanel onError={setError} />}
       {nav.kind === "tab" && nav.id === "extensions" && (
@@ -293,6 +317,7 @@ export const ConfigModal = memo(function ConfigModal({
           extensions={extensions}
           loading={loadingExts}
           failed={exts.value ? null : exts.failed}
+          reveal={target}
           onRetry={exts.reload}
           onError={setError}
           onRefresh={loadExtensions}
@@ -598,23 +623,28 @@ function CommandCharacter() {
 function SignOut({ onError }: { onError: (e: string) => void }) {
   const [required, setRequired] = useState(false);
   const [short, setShort] = useState(false);
+  const [sso, setSso] = useState(false);
   useEffect(() => {
-    api.authStatus().then((s) => { setRequired(s.authRequired); setShort(Boolean(s.shortPassword)); }).catch(() => {});
+    api.authStatus().then((s) => { setRequired(s.authRequired); setShort(Boolean(s.shortPassword)); setSso(Boolean(s.oidc)); }).catch(() => {});
   }, []);
   if (!required) return null;
   const signOut = () =>
     api
       .logout()
-      .then(() => window.dispatchEvent(new Event(SIGNED_OUT)))
+      // Where single sign-on ends the session at the provider too (Settings → Authentication), the browser goes there.
+      .then((r) => (r.endSession ? window.location.assign(r.endSession) : window.dispatchEvent(new Event(SIGNED_OUT))))
       .catch((e) => onError((e as Error).message));
   return (
-    <Section title={t("Signed in")} hint={t("Signing out asks for the password here again. Other browsers stay signed in.")}>
+    <Section
+      title={t("Signed in")}
+      hint={sso ? t("Signing out asks you to sign in here again. Other browsers stay signed in.") : t("Signing out asks for the password here again. Other browsers stay signed in.")}
+    >
       <button onClick={signOut} className={btnCls}>
         {t("Sign out")}
       </button>
       {short && (
         <p role="note" className="mt-3 text-xs text-warn">
-          {t("The portal's password is shorter than 8 characters. It keeps working because it was already in use, but anybody who can reach the portal can try to guess it. Set a longer PORTAL_PASSWORD and restart.")}
+          {t("The portal's password is shorter than 8 characters. It keeps working because it was already in use, but anybody who can reach the portal can try to guess it. Change it under Settings → Authentication.")}
         </p>
       )}
     </Section>
@@ -646,10 +676,23 @@ const THEMES: { value: Theme; label: string; icon: ReactNode }[] = [
   { value: "system", label: msg("Match the system"), icon: <LuMonitor /> },
 ];
 
-/** Light, dark, or whichever the system is — as three cards, each a glimpse of itself. */
+/**
+ * Light, dark, or whichever the system is — as three cards, each a glimpse of
+ * itself. And, where an installed extension brought any, whose colours: the
+ * portal's own or a theme's (see extensions/themes.ts).
+ */
 function Appearance() {
   const { theme, setTheme } = useTheme();
+  const brought = useThemes();
+  const chosen = usePalette();
+  // The one chosen is offered before its extension is loaded as well: it is what is painted.
+  const colours = [
+    { value: "", label: t("The portal's own") },
+    ...brought.map((th) => ({ value: th.id, label: th.name, hint: th.extension })),
+    ...(chosen && !brought.some((th) => th.id === chosen.id) ? [{ value: chosen.id, label: chosen.name }] : []),
+  ];
   return (
+    <>
     <div role="radiogroup" aria-label={t("Theme")} className="grid grid-cols-3 gap-2">
       {THEMES.map((th) => (
         <button
@@ -669,6 +712,20 @@ function Appearance() {
         </button>
       ))}
     </div>
+    {colours.length > 1 && (
+      <Field label={t("Colours")} hint={t("Themes the installed extensions brought.")} className="mt-4">
+        <Select
+          className="w-full sm:w-72"
+          aria-label={t("Colours")}
+          value={chosen?.id ?? ""}
+          options={colours}
+          onChange={(id) => {
+            if (id !== (chosen?.id ?? "")) chooseTheme(id || null);
+          }}
+        />
+      </Field>
+    )}
+    </>
   );
 }
 
@@ -732,8 +789,18 @@ function BrowserPanel({ onError }: { onError: (e: string) => void }) {
   );
 }
 
-/** Where this portal keeps what it keeps, set when it was deployed. */
+/** Where this portal keeps what it keeps, set when it was deployed; and updating it. */
 function AboutPanel({ onError }: { onError: (e: string) => void }) {
+  return (
+    <>
+      <AboutDeployment onError={onError} />
+      <UpdateSection />
+      <RestartSection />
+    </>
+  );
+}
+
+function AboutDeployment({ onError }: { onError: (e: string) => void }) {
   // What Defaults reads too, fetched ahead: drawn at once from what is kept.
   const { value: meta, failed, reload } = useCached("settings", api.settings, { onError: refreshFailed("settings", onError) });
   if (!meta && failed) return <LoadFailed error={failed} onRetry={reload} />;
@@ -1058,259 +1125,6 @@ function GeneralPanel({ onError, onProviders }: { onError: (e: string) => void; 
   );
 }
 
-// --- extensions ---
-
-const SOURCES = [
-  { label: "npm", placeholder: "npm:@scope/package", hint: msg("Install from npm") },
-  { label: "git", placeholder: "git:github.com/user/repo@v1", hint: msg("Install from a git repository") },
-  { label: "url", placeholder: "https://github.com/user/repo", hint: msg("Install from a URL") },
-  { label: "path", placeholder: "/absolute/path/to/package", hint: msg("Install from a folder on the server") },
-];
-
-function ExtensionsPanel({
-  extensions,
-  loading,
-  failed,
-  onRetry,
-  onError,
-  onRefresh,
-  onConfigure,
-}: {
-  extensions: ExtensionInfo[];
-  loading: boolean;
-  /** Why the list could not be read, when it has not been: "Nothing installed" would be a claim. */
-  failed: Error | null;
-  onRetry: () => unknown;
-  onError: (e: string) => void;
-  onRefresh: () => Promise<ExtensionInfo[]>;
-  onConfigure: (spec: string) => void;
-}) {
-  const [spec, setSpec] = useState("");
-  const [busy, setBusy] = useState<string | null>(null);
-  // The same, readable by a second Enter that comes before the draw.
-  const busyRef = useRef(false);
-  /** What the last switch did to the conversations that were open. */
-  const [note, setNote] = useState<(() => string) | null>(null);
-  // The names given in Settings → Tools. A package is one thing and should be
-  // called the same thing wherever it appears; the spec underneath is what it
-  // is installed and removed by, and that does not change.
-  const [names, setNames] = useState<Record<string, string>>({});
-  useEffect(() => {
-    api
-      .toolNames()
-      .then((r) => setNames(r.names))
-      .catch(() => setNames({}));
-  }, []);
-
-  const act = async (label: string, fn: () => Promise<unknown>) => {
-    // Enter in the name field gets here without the disabled button's say: a second install into the same folder collides with the first.
-    if (busyRef.current) return;
-    busyRef.current = true;
-    setBusy(label);
-    setNote(null);
-    try {
-      await fn();
-      await onRefresh();
-      setSpec("");
-    } catch (e) {
-      onError((e as Error).message);
-    } finally {
-      busyRef.current = false;
-      setBusy(null);
-    }
-  };
-
-  const switchPackage = (ext: ExtensionInfo) =>
-    act(ext.spec, async () => {
-      const on = !ext.enabled;
-      const r = await api.setExtensionEnabled(ext.spec, on);
-      const name = displayName(ext.name, names);
-      const parts = [() => (on ? t("{name} is on.", { name }) : t("{name} is off.", { name }))];
-      if (r.reloaded) parts.push(() => tp(r.reloaded, "{n} open conversation reloaded.", "{n} open conversations reloaded."));
-      if (r.waiting)
-        parts.push(() =>
-          tp(r.waiting, "{n} still working — it keeps it as it was until /reload, or its next start.", "{n} still working — they keep it as it was until /reload, or their next start."),
-        );
-      setNote(() => () => parts.map((part) => part()).join(" "));
-    });
-
-  const installed = useMemo(() => new Set(extensions.flatMap((e) => [e.name, packageName(e.spec)])), [extensions]);
-
-  return (
-    <>
-      <Section
-        title={t("Find packages")}
-        hint={t("Published for pi on npm: tools, skills, providers and themes. The most used first.")}
-      >
-        <PackageCatalog installed={installed} onInstalled={() => void onRefresh()} onError={onError} limit={6} />
-      </Section>
-
-      <Section
-        title={t("Install by name")}
-        hint={t("From npm, git, a URL or a folder on the server. They persist across restarts.")}
-      >
-        <div className="flex gap-2">
-          <input
-            value={spec}
-            onChange={(e) => setSpec(e.target.value)}
-            onKeyDown={(e) =>
-              isEnter(e) &&
-              spec.trim() &&
-              act("install", () => api.installPackage(spec.trim()))
-            }
-            placeholder="npm:@scope/package"
-            aria-label={t("Install by name")}
-            className={`${inputCls} font-mono text-xs`}
-          />
-          <button
-            disabled={!spec.trim() || busy !== null}
-            onClick={() => act("install", () => api.installPackage(spec.trim()))}
-            className={primaryCls}
-          >
-            <LuDownload className="h-4 w-4" />
-            {busy === "install" ? t("Installing…") : t("Install")}
-          </button>
-        </div>
-        <div className="mt-2 flex flex-wrap gap-1">
-          {SOURCES.map((s) => (
-            <button
-              key={s.label}
-              onClick={() => setSpec(s.placeholder)}
-              title={t(s.hint)}
-              className="rounded-lg bg-fg/5 px-2 py-0.5 font-mono text-[11px] text-fg-muted transition hover:bg-fg/10 hover:text-fg"
-            >
-              {s.label}
-            </button>
-          ))}
-        </div>
-      </Section>
-
-      <Section title={`${t("Installed")}${extensions.length ? ` (${extensions.length})` : ""}`}>
-        {loading ? (
-          <p className="text-sm text-fg-subtle">{t("Reading installed packages…")}</p>
-        ) : failed ? (
-          <LoadFailed error={failed} onRetry={onRetry} />
-        ) : extensions.length === 0 ? (
-          <Empty>
-            {t("Nothing installed yet.")}
-            <p className="mt-1 text-xs text-fg-faint">
-              {t("Installed commands show up in the chat box when you type “/”.")}
-            </p>
-          </Empty>
-        ) : (
-          <ul className="space-y-1.5">
-            {extensions.map((ext) => (
-              <li
-                key={ext.spec}
-                className="rounded-xl border border-line bg-raised/40 px-3 py-2.5"
-              >
-                <div className="flex items-center gap-2">
-                  <LuPuzzle className="h-4 w-4 shrink-0 text-fg-subtle" />
-                  <p
-                    title={ext.name}
-                    className={`truncate text-sm ${ext.enabled === false ? "text-fg-subtle line-through decoration-fg-faint" : "text-fg"}`}
-                  >
-                    {displayName(ext.name, names)}
-                  </p>
-                  {ext.enabled === false && (
-                    <span className="shrink-0 rounded bg-warn/10 px-1.5 py-0.5 text-[10px] text-warn">{t("off")}</span>
-                  )}
-                  {ext.filtered && (
-                    <span
-                      title={t("Some of what it brings is switched off in settings.json. Switching it off and on again keeps that.")}
-                      className="shrink-0 rounded bg-fg/5 px-1.5 py-0.5 text-[10px] text-fg-subtle"
-                    >
-                      {t("filtered")}
-                    </span>
-                  )}
-                  {ext.version && (
-                    <span className="shrink-0 rounded bg-fg/5 px-1.5 py-0.5 font-mono text-[10px] text-fg-subtle">
-                      v{ext.version}
-                    </span>
-                  )}
-                  {ext.scope && (
-                    <span className="shrink-0 rounded bg-fg/5 px-1.5 py-0.5 text-[10px] text-fg-subtle">
-                      {ext.scope}
-                    </span>
-                  )}
-                  {ext.enabled !== undefined && (
-                    <Switch
-                      on={ext.enabled}
-                      onChange={() => switchPackage(ext)}
-                      label={ext.enabled ? t("Switch off {name}", { name: displayName(ext.name, names) }) : t("Switch on {name}", { name: displayName(ext.name, names) })}
-                      title={
-                        ext.enabled
-                          ? t("On — click to switch it off without uninstalling it")
-                          : t("Off — its commands, skills and tools are not loaded. Click to switch it on")
-                      }
-                      disabled={busy !== null}
-                      className="ml-auto"
-                    />
-                  )}
-                  <button
-                    disabled={busy !== null}
-                    onClick={async () => {
-                      // Its commands, tools and skills go from every chat, and the switch beside it is easy to miss for this one.
-                      const name = displayName(ext.name, names);
-                      if (!(await confirmDialog({ title: t("Remove {name}?", { name }), message: t("It is uninstalled: its commands, tools and skills are gone from every chat."), confirmLabel: t("Remove"), danger: true, deletes: true }))) return;
-                      await act(ext.spec, () => api.removePackage(ext.spec));
-                    }}
-                    title={t("Remove")}
-                    aria-label={t("Remove {name}", { name: displayName(ext.name, names) })}
-                    className={`${ext.enabled === undefined ? "ml-auto " : ""}shrink-0 rounded-lg p-1.5 text-fg-subtle transition hover:bg-danger/10 hover:text-danger disabled:opacity-40`}
-                  >
-                    {busy === ext.spec ? (
-                      <LuRefreshCw className="h-3.5 w-3.5 animate-spin" />
-                    ) : (
-                      <LuTrash2 className="h-3.5 w-3.5" />
-                    )}
-                  </button>
-                </div>
-
-                {ext.description && (
-                  <p className="mt-1 line-clamp-2 text-xs text-fg-subtle">{ext.description}</p>
-                )}
-
-                <div className="mt-1.5 flex items-center gap-3">
-                  <span className="truncate font-mono text-[10px] text-fg-faint">{ext.spec}</span>
-                  {ext.settings.length > 0 && (
-                    <button
-                      onClick={() => onConfigure(ext.spec)}
-                      className="ml-auto shrink-0 text-[11px] text-accent hover:text-accent"
-                    >
-                      {t("Configure ({n})", { n: ext.settings.length })} ›
-                    </button>
-                  )}
-                </div>
-              </li>
-            ))}
-          </ul>
-        )}
-
-        {note && (
-          <p role="status" className="mt-2 text-xs text-fg-muted">
-            {note()}
-          </p>
-        )}
-
-        <div className="mt-2.5 flex items-center gap-2">
-          <button
-            disabled={busy !== null}
-            onClick={() => act("update", () => api.updatePackages())}
-            className={btnCls}
-          >
-            <LuDownload className="h-4 w-4" />
-            {busy === "update" ? t("Updating…") : t("Update all")}
-          </button>
-          <button onClick={() => onRefresh()} className={btnCls}>
-            <LuRefreshCw className="h-4 w-4" /> {t("Refresh")}
-          </button>
-        </div>
-      </Section>
-    </>
-  );
-}
-
 // --- one extension's own settings ---
 
 function ExtensionPanel({
@@ -1325,6 +1139,7 @@ function ExtensionPanel({
   const [values, setValues] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null);
   const [savedKey, setSavedKey] = useState<string | null>(null);
+  const settingsPages = useSlot("settings.page");
 
   /** A stored value as the field shows it. */
   const shown = (s: ExtensionInfo["settings"][number]) => (s.value == null ? "" : typeof s.value === "object" ? JSON.stringify(s.value) : String(s.value));
@@ -1386,6 +1201,15 @@ function ExtensionPanel({
         )}
       </div>
 
+      {/* The package's own page, where it brought one, above what the portal found for it. One that fails to draw says so, and the fields stay. */}
+      {settingsPages.filter((page) => page.extension === ext.name).map((page) => (
+        <div key={page.key} className="mb-5" data-extension={page.extension}>
+          <ErrorBoundary resetKey={page.key} fallback={(error) => <PartFailed error={error} />}>
+            <page.component />
+          </ErrorBoundary>
+        </div>
+      ))}
+      {ext.settings.length > 0 && (
       <Section title={t("Settings")} hint={t("Saved into pi's settings.json. An extension reads them when a chat starts.")}>
         <div className="stagger-in space-y-2">
           {ext.settings.map((s) => {
@@ -1442,13 +1266,16 @@ function ExtensionPanel({
           })}
         </div>
       </Section>
+      )}
 
+      {ext.settings.length > 0 && (
       <div className="flex items-start gap-2 rounded-xl border border-warn/25 bg-warn/10 px-3 py-2 text-xs text-warn/90">
         <LuTriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
         <p>
           {t("pi publishes no schema for extension settings, so these keys are recovered by reading the package's source. A key built dynamically at runtime won't appear here — use Advanced to edit settings.json directly.")}
         </p>
       </div>
+      )}
     </>
   );
 }

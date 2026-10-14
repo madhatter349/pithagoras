@@ -37,12 +37,16 @@ export interface PiTool {
   package?: string;
   /** One of the portal's own, from an inline extension: no file or package of anyone's has a path like that, so it is not mistaken for an extension's of the same name. */
   inline?: true;
+  /** Offered to scripts only (pi's `codemode` and `deferred` exposure): never in what the model is offered, so it has no lazy mark to give. */
+  scriptsOnly?: true;
   /** An MCP server's tool listed from the adapter's cache, its server not started until the tool is first used. */
   cached?: true;
   /** False when this conversation has it switched off. */
   enabled: boolean;
   /** Whether it is on by default, so the page can say where a chat disagrees. */
   defaultOn?: boolean;
+  /** Not offered one by one but found through the `tools` tool: a tool marked lazy. It is on, and switched like any other. */
+  lazy?: true;
 }
 
 /**
@@ -79,6 +83,8 @@ export interface PiClient extends EventEmitter {
    */
   subagentInput?(id: string, text: string): boolean;
   subagentStop?(id: string): boolean;
+  /** What a page says to an extension's own half in this chat. Absent where the executor cannot reach the extensions. */
+  tellExtension?(extension: string, data: unknown): boolean;
   /** How many subagents it announced are still running: a background one outlives the turn that started it. */
   subagentsRunning?(): number;
   /** How many dialogs an extension has open, waiting on a person: its pi is not one to stop. */
@@ -140,8 +146,11 @@ export interface PiClient extends EventEmitter {
    * Optional: an executor that cannot ask pi leaves it out.
    */
   getTools?(): Promise<PiTool[]>;
-  /** Switch tools off by name. Everything not named is on. */
-  setToolsOff?(names: string[]): Promise<void>;
+  /**
+   * Switch tools off by name. Everything not named is on. `lazy.tools` are on but not in the list the
+   * model is offered: it finds them through the `tools` tool, and `lazy.sets` names the sets they are in.
+   */
+  setToolsOff?(names: string[], lazy?: { tools: string[]; sets: string[] }): Promise<void>;
 
   setModel(provider: string, modelId: string): Promise<void>;
   setThinkingLevel(level: string): Promise<void>;
@@ -158,6 +167,8 @@ export interface PiClient extends EventEmitter {
 
   /** Answer an extension dialog. Returns false if the request is unknown/expired. */
   respondUi(id: string, response: { cancelled?: boolean; value?: unknown }): boolean;
+  /** The dialogs (confirm, select, input, editor, questions) still waiting, as sent, for a page that opens meanwhile. Only where the portal draws them. */
+  openDialogRequests?(): Record<string, unknown>[];
 }
 
 /** What is in a chat's box, and what is selected in it: where a paste goes. */

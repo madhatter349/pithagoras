@@ -112,16 +112,11 @@ the entry keeps the id users pick, rewrites the request to the real upstream
 `cline-pass/deepseek-v4.1-flash` through `samplingParams.model`, and pins the
 backend with `compat.vercelGatewayRouting.only = ["wafer"]`.
 
-Pithagoras pins pi **0.82.1**, which implements `vercelGatewayRouting` (verified
-in `pi-ai/dist/api/openai-completions.js`: it sends
-`providerOptions: { gateway: { only: ["wafer"] } }`) but **not** `samplingParams`.
-So the alias id is sent upstream unchanged, that model does not exist there, and
-every task dies with `404 "model not found"`.
-
-Using the real upstream id *and* the same routing pin reproduces exactly the
-backend the alias selects, and works on the pinned pi — no version bump, which
-would put the runner's `pi` out of step with the portal's RPC protocol. The model
-still shows in the UI as **DeepSeek V4.1 Flash-Wafer**.
+Pithagoras pins pi **1.1.0** (the version upstream Pithagoras validates), so the
+alias would work as-is. The seed still uses the real upstream id *and* the same
+routing pin, which reproduces exactly the backend the alias selects and does not
+depend on `samplingParams` support. The model still shows in the UI as
+**DeepSeek V4.1 Flash-Wafer**.
 
 ## Deploying a change
 

@@ -5,6 +5,7 @@ import { askQuestion, dropQuestion, offerOf } from "../questions.js";
 import { channelSupervisor } from "../channels/supervisor.js";
 import { sessions } from "../session-manager.js";
 import { getPerson } from "../people.js";
+import { debugLog } from "../logs.js";
 import { approvalCannotHelp } from "./guard.js";
 import { fail, say } from "./tool-result.js";
 
@@ -25,31 +26,19 @@ export function askPrimaryTool(sessionId: string) {
       name: "ask_primary",
       label: "Ask the primary user",
       description:
-        "Put a question to your primary user on behalf of the person you are talking to. Use it " +
-        "when they need something you are not allowed to do, or a decision that is not yours. " +
-        "The answer comes back into this conversation later — it does not arrive during this " +
-        "turn, so tell them you have asked and leave it there.",
-      promptSnippet: "ask_primary — pass a request to your primary user and get an answer back",
+        "Ask your primary user, for the person you are talking to, for something you may not do or a decision that is not yours. " +
+        "The answer arrives later as a message, not in this turn: tell them you asked and stop there.",
+      promptSnippet: "pass a request to your primary user and get an answer back",
       parameters: Type.Object({
-        question: Type.String({
-          description:
-            "The question, written for someone who cannot see this conversation: who is asking, " +
-            "what they want, and what you would do if they said yes.",
-        }),
+        question: Type.String({ description: "For someone who cannot see this chat: who asks, what they want, what you would do if yes" }),
         action: Type.Optional(
           Type.String({
             description:
-              "When you are asking permission to do one specific thing, the exact thing — the " +
-              "shell command verbatim, or the path you would write; for edit_image the path of " +
-              "each picture, one to a line, in the order of the call; for any other tool the " +
-              "refusal says what to write. Approving authorises this " +
-              "and nothing else, so it must be exactly what you intend to run, once. Leave it " +
-              "out when you are asking for a decision rather than permission.",
+              "For permission to do one exact thing: the shell command verbatim, or the path to write; for edit_image each picture's path, one per line, in call order; " +
+              "for other tools the refusal says what to write. Approval covers exactly this, once. Omit when asking for a decision",
           })
         ),
-        actionTool: Type.Optional(
-          Type.String({ description: "The tool the action belongs to. Defaults to bash." })
-        ),
+        actionTool: Type.Optional(Type.String({ description: "The action's tool; default bash" })),
       }),
       async execute(_id: string, p: any) {
         const question = String(p.question ?? "").trim();
@@ -123,8 +112,11 @@ export function askPrimaryTool(sessionId: string) {
           // Nobody was told of it, so nothing is waiting for an answer, and the id of a question nobody has seen
           // is not one to leave answerable.
           dropQuestion(row.id);
+          debugLog("approval", "not delivered", { question: row.id, tool: row.action ? row.action_tool : undefined, session: sessionId });
           return fail(`Could not reach them: ${(e as Error).message}`);
         }
+        // The kind of question and where it stands, not its words or the action: those can hold anything.
+        debugLog("approval", "asked", { question: row.id, tool: row.action ? row.action_tool : undefined, session: sessionId, immediate });
 
         return say(
           `Asked. Tell ${row.person_name} you have passed it on and that you will come back ` +
